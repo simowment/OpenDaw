@@ -9,4 +9,5 @@ CMakeSettings.json
 *.swp
 *.swo
 *~
-.cursor/
+.cursor/__pycache__/
+*.pyc
