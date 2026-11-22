@@ -1,4 +1,5 @@
 #include "EditManager.h"
+#include <QCoreApplication>
 #include "LooperEngine.h"
 #include "instruments/SoundFontInstrument.h"
 #include "utils/FFmpegUtils.h"
@@ -15,6 +16,8 @@
 #include <QCryptographicHash>
 #include <QDateTime>
 #include <QSettings>
+#include <optional>
+#include <utility>
 
 namespace OpenDaw {
 
@@ -73,6 +76,9 @@ void EditManager::teardownCurrentEdit()
     transport.removeListener(recordingListener_.get());
 
     qDebug() << "[teardown] freeing playback context";
+    // A render session belongs to this Edit; end it before the Edit goes.
+    renderStatus_.reset();
+    renderSessionDepth_ = 0;
     transport.freePlaybackContext();
 
     for (auto& [id, state] : frozenTracks_) {
@@ -89,7 +95,95 @@ void EditManager::teardownCurrentEdit()
 void EditManager::markDirtyAndNotify()
 {
     hasUnsavedChanges_ = true;
-    emit editChanged();
+    emitEditChanged();
+}
+
+// ── Signal batching ──────────────────────────────────────────────────────────
+
+void EditManager::emitTracksChanged()
+{
+    if (signalBatchDepth_ > 0) pendingTracksChanged_ = true;
+    else emit tracksChanged();
+}
+
+void EditManager::emitRoutingChanged()
+{
+    if (signalBatchDepth_ > 0) pendingRoutingChanged_ = true;
+    else emit routingChanged();
+}
+
+void EditManager::emitEditChanged()
+{
+    if (signalBatchDepth_ > 0) pendingEditChanged_ = true;
+    else emit editChanged();
+}
+
+void EditManager::beginSignalBatch()
+{
+    ++signalBatchDepth_;
+}
+
+void EditManager::endSignalBatch()
+{
+    jassert(signalBatchDepth_ > 0);
+    if (signalBatchDepth_ <= 0 || --signalBatchDepth_ > 0) return;
+    const bool tracks = std::exchange(pendingTracksChanged_, false);
+    const bool routing = std::exchange(pendingRoutingChanged_, false);
+    const bool edit = std::exchange(pendingEditChanged_, false);
+    // Track widgets first: editChanged refreshes the existing ones.
+    if (tracks) emit tracksChanged();
+    if (routing) emit routingChanged();
+    if (edit) emit editChanged();
+}
+
+// ── Undo grouping ────────────────────────────────────────────────────────────
+
+void EditManager::beginUndoGroup()
+{
+    ++undoGroupDepth_;
+}
+
+void EditManager::endUndoGroup()
+{
+    jassert(undoGroupDepth_ > 0);
+    if (undoGroupDepth_ > 0) --undoGroupDepth_;
+}
+
+void EditManager::beginTransaction(const juce::String& name)
+{
+    if (!edit_ || undoGroupDepth_ > 0) return;
+    edit_->getUndoManager().beginNewTransaction(name);
+}
+
+// ── Render claim and session ─────────────────────────────────────────────────
+
+bool EditManager::tryClaimRender()
+{
+    return !renderInProgress_.exchange(true);
+}
+
+void EditManager::releaseRender()
+{
+    renderInProgress_ = false;
+}
+
+void EditManager::beginRenderSession()
+{
+    TRACKTION_ASSERT_MESSAGE_THREAD
+    if (!edit_) return;
+    if (renderSessionDepth_.fetch_add(1) == 0) {
+        // Rebuild the live graph afterwards only if there was one (not while
+        // the engine is suspended or in a headless run without a device).
+        renderStatus_ = std::make_unique<te::Edit::ScopedRenderStatus>(*edit_, true);
+    }
+}
+
+void EditManager::endRenderSession()
+{
+    TRACKTION_ASSERT_MESSAGE_THREAD
+    if (renderSessionDepth_.load() <= 0) return;   // ended by an edit change already
+    if (renderSessionDepth_.fetch_sub(1) == 1)
+        renderStatus_.reset();   // reallocates the playback context
 }
 
 void EditManager::createDefaultEdit()
@@ -231,6 +325,7 @@ te::AudioTrack* EditManager::addAudioTrack()
 {
     if (!edit_)
         return nullptr;
+    const ScopedSignalBatch batch(*this);
     edit_->ensureNumberOfAudioTracks(trackCount() + 1);
     auto tracks = getAudioTracks();
     auto* newTrack = tracks.getLast();
@@ -246,7 +341,7 @@ te::AudioTrack* EditManager::addAudioTrack()
         }
     }
     assignMissingTrackColours();
-    emit tracksChanged();
+    emitTracksChanged();
     return newTrack;
 }
 
@@ -452,12 +547,19 @@ void EditManager::setTimeSignature(int num, int den)
 
 te::AudioTrack* EditManager::addMidiTrack()
 {
+    // One tracksChanged for the track, its MIDI flag and its instrument (each
+    // one rebuilds every mixer strip and track header), and one undo step:
+    // the instrument goes into the caller's transaction with the track.
+    const ScopedSignalBatch batch(*this);
     auto* track = addAudioTrack();
     if (track) {
         markAsMidiTrack(track);
         // New MIDI tracks play straight away, on the built-in piano.
-        if (SoundFontLibrary::instance().isAvailable())
+        if (SoundFontLibrary::instance().isAvailable()) {
+            beginUndoGroup();
             setTrackBuiltInInstrument(*track, 0, 0);
+            endUndoGroup();
+        }
     }
     return track;
 }
@@ -494,6 +596,8 @@ te::MidiClip* EditManager::importMidiFileToTrack(te::AudioTrack& track,
     if (!midi.readFrom(stream)) return nullptr;
 
     midi.convertTimestampTicksToSeconds();
+    // Adds clips and maybe tracks only: one refresh at the end.
+    const ScopedSignalBatch batch(*this);
 
     double totalDuration = 0.0;
     for (int t = 0; t < midi.getNumTracks(); ++t) {
@@ -663,7 +767,7 @@ void EditManager::setTrackMono(te::AudioTrack& track, bool mono)
 
     if (changed) {
         markDirtyAndNotify();
-        emit tracksChanged();
+        emitTracksChanged();
     }
 }
 
@@ -686,7 +790,7 @@ void EditManager::setTrackInstrument(te::AudioTrack& track,
         track.pluginList.insertPlugin(plugin, 0, nullptr);
         markAsMidiTrack(&track);
         markDirtyAndNotify();
-        emit tracksChanged();
+        emitTracksChanged();
     }
 }
 
@@ -700,7 +804,7 @@ void EditManager::removeTrackInstrument(te::AudioTrack& track)
 void EditManager::setTrackBuiltInInstrument(te::AudioTrack& track, int bank, int program)
 {
     if (!edit_) return;
-    edit_->getUndoManager().beginNewTransaction("Change Instrument");
+    beginTransaction("Change Instrument");
     // Changing sound on the built-in instrument keeps the plugin (and its place).
     if (auto* sf = dynamic_cast<SoundFontPlugin*>(getTrackInstrument(&track))) {
         sf->setPreset(bank, program);
@@ -711,14 +815,14 @@ void EditManager::setTrackBuiltInInstrument(te::AudioTrack& track, int bank, int
     }
     markAsMidiTrack(&track);
     markDirtyAndNotify();
-    emit tracksChanged();
+    emitTracksChanged();
 }
 
 void EditManager::markAsMidiTrack(te::AudioTrack* track)
 {
     if (track) {
         midiTrackIds_.insert(track->itemID.getRawID());
-        emit tracksChanged();
+        emitTracksChanged();
     }
 }
 
@@ -849,7 +953,7 @@ te::AudioTrack* EditManager::splitTrackByHands(te::AudioTrack& track,
     if (rightNotes.empty() || rightNotes.size() != isLeftHand.size()) return nullptr;
 
     auto& um = edit_->getUndoManager();
-    um.beginNewTransaction("Split Piano Hands");
+    beginTransaction("Split Piano Hands");
 
     auto copyPtr = edit_->copyTrack(&track, te::TrackInsertPoint(track, false));
     auto* leftTrack = dynamic_cast<te::AudioTrack*>(copyPtr.get());
@@ -902,8 +1006,8 @@ te::AudioTrack* EditManager::splitTrackByHands(te::AudioTrack& track,
     }
     saveDisplayItems(items);
 
-    emit tracksChanged();
-    emit routingChanged();
+    emitTracksChanged();
+    emitRoutingChanged();
     markDirtyAndNotify();
     return leftTrack;
 }
@@ -1094,14 +1198,14 @@ void EditManager::assignInputToTrack(te::AudioTrack& track, const juce::String& 
     }
 
     markDirtyAndNotify();
-    emit routingChanged();
+    emitRoutingChanged();
 }
 
 void EditManager::clearTrackInput(te::AudioTrack& track)
 {
     clearTrackInputInternal(track);
     markDirtyAndNotify();
-    emit routingChanged();
+    emitRoutingChanged();
 }
 
 QList<InputSource> EditManager::getAvailableMidiInputSources() const
@@ -1137,7 +1241,7 @@ void EditManager::assignMidiInputToTrack(te::AudioTrack& track,
     }
 
     markDirtyAndNotify();
-    emit routingChanged();
+    emitRoutingChanged();
 }
 
 QString EditManager::getTrackInputName(te::AudioTrack* track) const
@@ -1510,7 +1614,7 @@ bool EditManager::compTake(te::AudioTrack& track, int takeId, double startSec, d
     if (t1 - t0 < 0.01) return false;
 
     auto& um = edit_->getUndoManager();
-    um.beginNewTransaction("Comp " + juce::String(take.name.toStdString()));
+    beginTransaction("Comp " + juce::String(take.name.toStdString()));
 
     const tracktion::TimeRange range(tracktion::TimePosition::fromSeconds(t0),
                                      tracktion::TimePosition::fromSeconds(t1));
@@ -1607,7 +1711,7 @@ void EditManager::deleteTimeRange(const juce::Array<te::AudioTrack*>& tracks,
                                   tracktion::TimeRange range, bool ripple)
 {
     if (!edit_ || range.getLength().inSeconds() <= 0.0) return;
-    edit_->getUndoManager().beginNewTransaction(ripple ? "Ripple Delete" : "Delete Range");
+    beginTransaction(ripple ? "Ripple Delete" : "Delete Range");
     for (auto* track : tracks) {
         if (!track) continue;
         track->deleteRegion(range, nullptr);
@@ -1623,7 +1727,7 @@ void EditManager::splitTracksAt(const juce::Array<te::AudioTrack*>& tracks,
                                 tracktion::TimePosition time)
 {
     if (!edit_) return;
-    edit_->getUndoManager().beginNewTransaction("Split");
+    beginTransaction("Split");
     for (auto* track : tracks) {
         if (!track) continue;
         juce::Array<te::Clip*> toSplit;
@@ -1641,7 +1745,7 @@ void EditManager::splitTracksAt(const juce::Array<te::AudioTrack*>& tracks,
 void EditManager::deleteClips(const std::vector<te::Clip*>& clips, bool ripple)
 {
     if (!edit_ || clips.empty()) return;
-    edit_->getUndoManager().beginNewTransaction(ripple ? "Ripple Delete" : "Delete Clips");
+    beginTransaction(ripple ? "Ripple Delete" : "Delete Clips");
 
     // The gaps to close, per track, merged so overlapping or linked clips
     // close their shared gap once.
@@ -1753,7 +1857,7 @@ void EditManager::setTrackOutputToMaster(te::AudioTrack& track)
     track.state.setProperty(juce::Identifier("outputDisconnected"), false,
                             &edit_->getUndoManager());
     track.getOutput().setOutputToDefaultDevice(false);
-    emit routingChanged();
+    emitRoutingChanged();
     markDirtyAndNotify();
 }
 
@@ -1767,7 +1871,7 @@ void EditManager::setTrackOutputToTrack(te::AudioTrack& src, te::AudioTrack& des
     src.state.setProperty(juce::Identifier("outputDisconnected"), false,
                           &edit_->getUndoManager());
     src.getOutput().setOutputToTrack(&dest);
-    emit routingChanged();
+    emitRoutingChanged();
     markDirtyAndNotify();
 }
 
@@ -1777,7 +1881,7 @@ void EditManager::clearTrackOutput(te::AudioTrack& track)
     track.state.setProperty(juce::Identifier("outputDisconnected"), true,
                             &edit_->getUndoManager());
     track.getOutput().setOutputToTrack(nullptr);
-    emit routingChanged();
+    emitRoutingChanged();
     markDirtyAndNotify();
 }
 
@@ -1817,7 +1921,7 @@ void EditManager::setTrackOutputToDevice(te::AudioTrack& track, const juce::Stri
     track.state.setProperty(juce::Identifier("outputDisconnected"), false,
                             &edit_->getUndoManager());
     track.getOutput().setOutputToDeviceID(deviceID);
-    emit routingChanged();
+    emitRoutingChanged();
     markDirtyAndNotify();
 }
 
@@ -1891,13 +1995,14 @@ QString EditManager::getTrackOutputName(te::AudioTrack* track) const
 
 te::AudioTrack* EditManager::addBusTrack()
 {
+    const ScopedSignalBatch batch(*this);
     auto* track = addAudioTrack();
     if (track) {
         track->state.setProperty(juce::Identifier("isBus"), true,
                                  &edit_->getUndoManager());
         track->setName(juce::String("Bus " + juce::String(getBusTracks().size())));
-        emit tracksChanged();
-        emit routingChanged();
+        emitTracksChanged();
+        emitRoutingChanged();
     }
     return track;
 }
@@ -1936,8 +2041,8 @@ te::AudioTrack* EditManager::addFxBus(const QString& effectName)
     else if (effectName == "Chorus") xmlType = te::ChorusPlugin::xmlTypeName;
     else if (effectName == "Phaser") xmlType = te::PhaserPlugin::xmlTypeName;
 
-    auto& um = edit_->getUndoManager();
-    um.beginNewTransaction("Add " + juce::String(effectName.toStdString()) + " Bus");
+    beginTransaction("Add " + juce::String(effectName.toStdString()) + " Bus");
+    const ScopedSignalBatch batch(*this);
 
     auto* bus = addBusTrack();
     if (!bus) return nullptr;
@@ -1969,8 +2074,8 @@ te::AudioTrack* EditManager::addFxBus(const QString& effectName)
     }
     auxBusNumberFor(*bus);
 
-    emit tracksChanged();
-    emit routingChanged();
+    emitTracksChanged();
+    emitRoutingChanged();
     markDirtyAndNotify();
     return bus;
 }
@@ -2099,8 +2204,7 @@ te::AuxSendPlugin* EditManager::addSend(te::AudioTrack& src, te::AudioTrack& bus
     if (!canSendTo(&src, &bus)) return nullptr;
     if (auto* existing = findSend(src, bus)) return existing;
 
-    auto& um = edit_->getUndoManager();
-    um.beginNewTransaction("Add Send");
+    beginTransaction("Add Send");
     int number = auxBusNumberFor(bus);
     if (number < 0) return nullptr;
 
@@ -2125,7 +2229,7 @@ te::AuxSendPlugin* EditManager::addSend(te::AudioTrack& src, te::AudioTrack& bus
     }
     src.pluginList.insertPlugin(plugin, index, nullptr);
 
-    emit routingChanged();
+    emitRoutingChanged();
     markDirtyAndNotify();
     return send;
 }
@@ -2135,7 +2239,7 @@ void EditManager::removeSend(te::AudioTrack& src, te::AudioTrack& bus)
     if (!edit_) return;
     auto* send = findSend(src, bus);
     if (!send) return;
-    edit_->getUndoManager().beginNewTransaction("Remove Send");
+    beginTransaction("Remove Send");
     send->deleteFromParent();
     emit routingChanged();
     markDirtyAndNotify();
@@ -2168,7 +2272,7 @@ void EditManager::setSendPreFader(te::AudioTrack& src, te::AudioTrack& bus, bool
     if (!fader) return;
 
     auto& um = edit_->getUndoManager();
-    um.beginNewTransaction(preFader ? "Make Send Pre-Fader" : "Make Send Post-Fader");
+    beginTransaction(preFader ? "Make Send Pre-Fader" : "Make Send Post-Fader");
     // Moving to the fader's index lands just after it when coming from before
     // (the fader shifts down) and just before it when coming from after.
     auto parent = send->state.getParent();
@@ -2183,7 +2287,7 @@ void EditManager::setSendMuted(te::AudioTrack& src, te::AudioTrack& bus, bool mu
     if (!edit_) return;
     auto* send = findSend(src, bus);
     if (!send || send->isEnabled() == !muted) return;
-    edit_->getUndoManager().beginNewTransaction(muted ? "Mute Send" : "Unmute Send");
+    beginTransaction(muted ? "Mute Send" : "Unmute Send");
     // A disabled send is left out of the playback graph; its level is kept.
     send->setEnabled(!muted);
     hasUnsavedChanges_ = true;
@@ -2195,7 +2299,7 @@ void EditManager::setSendPhaseInverted(te::AudioTrack& src, te::AudioTrack& bus,
     if (!edit_) return;
     auto* send = findSend(src, bus);
     if (!send || send->invertPhase.get() == inverted) return;
-    edit_->getUndoManager().beginNewTransaction("Invert Send Phase");
+    beginTransaction("Invert Send Phase");
     send->invertPhase = inverted;
     hasUnsavedChanges_ = true;
     emit sendChanged(&src, &bus);
@@ -2225,7 +2329,7 @@ void EditManager::setInputDisplayName(const juce::String& deviceName,
 {
     inputDisplayNames_[deviceName.toStdString()] = customName;
     saveInputDisplayNames();
-    emit routingChanged();
+    emitRoutingChanged();
 }
 
 QString EditManager::getInputDisplayName(const juce::String& deviceName) const
@@ -2463,7 +2567,7 @@ int EditManager::addFolder(const QString& name, te::AudioTrack* insertBefore)
     }
     saveRawDisplayOrder(raw);
 
-    QTimer::singleShot(0, this, [this]() { emit tracksChanged(); });
+    QTimer::singleShot(0, this, [this]() { emitTracksChanged(); });
     return nextId;
 }
 
@@ -2490,7 +2594,7 @@ void EditManager::removeFolder(int folderId)
     raw.removeAll(QString("f%1").arg(folderId));
     saveRawDisplayOrder(raw);
 
-    QTimer::singleShot(0, this, [this]() { emit tracksChanged(); });
+    QTimer::singleShot(0, this, [this]() { emitTracksChanged(); });
 }
 
 void EditManager::renameFolder(int folderId, const QString& name)
@@ -2505,7 +2609,7 @@ void EditManager::renameFolder(int folderId, const QString& name)
             child.setProperty(kFolderNameProp,
                               juce::String(name.toStdString()),
                               &edit_->getUndoManager());
-            emit tracksChanged();
+            emitTracksChanged();
             return;
         }
     }
@@ -2754,39 +2858,129 @@ void EditManager::cleanupFreezeState(te::AudioTrack& track)
     frozenTracks_.erase(it);
 }
 
-bool EditManager::exportMix(const ExportSettings& settings,
-                            std::function<void(float)> progressCallback)
+// Runs a Tracktion render task to completion. On the message thread (agent
+// renders, freeze, bounce) the event loop is blocked while we loop, but audio
+// clip nodes only become ready once Tracktion's file readers have been serviced
+// through it: without pumping, runJob() returns jobNeedsRunningAgain forever and
+// the whole program hangs. So, on the message thread, non-input events are
+// pumped between slices (user input stays blocked; agent tools return BUSY
+// while renderInProgress_ is set). A watchdog aborts a render that makes no
+// progress for kStallSeconds instead of hanging.
+static bool runRenderTaskToEnd(te::Renderer::RenderTask& task, std::atomic<float>& progress,
+                               const std::function<void(float)>& onProgress, juce::String& error)
 {
+    constexpr double kStallSeconds = 60.0;
+    const bool onMessageThread = juce::MessageManager::existsAndIsCurrentThread();
+    float lastProgress = -1.0f;
+    auto lastChange = juce::Time::getMillisecondCounterHiRes();
+    auto lastPump = lastChange;
+
+    while (true) {
+        const auto status = task.runJob();
+        const float p = progress.load();
+        if (onProgress) onProgress(p);
+        if (status == juce::ThreadPoolJob::jobHasFinished)
+            return task.errorMessage.isEmpty();
+
+        const auto now = juce::Time::getMillisecondCounterHiRes();
+        if (p != lastProgress) {
+            lastProgress = p;
+            lastChange = now;
+        } else if (now - lastChange > kStallSeconds * 1000.0) {
+            task.signalJobShouldExit();
+            error = "the render made no progress for " + juce::String(int(kStallSeconds))
+                    + " seconds and was stopped";
+            qWarning() << "[render]" << QString::fromStdString(error.toStdString());
+            return false;
+        }
+        if (onMessageThread && now - lastPump > 10.0) {
+            QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 5);
+            lastPump = juce::Time::getMillisecondCounterHiRes();
+        }
+    }
+}
+
+bool EditManager::exportMix(const ExportSettings& settings,
+                            std::function<void(float)> progressCallback,
+                            ExportOutcome* outcome)
+{
+    if (outcome) *outcome = ExportOutcome::Failed;
     if (!edit_) return false;
-    if (renderInProgress_) return false;
+    if (settings.renderClaimed) {
+        // The caller claimed on the GUI thread (tryClaimRender) and releases.
+        jassert(renderInProgress_.load());
+    } else if (renderInProgress_.exchange(true)) {
+        // Another render runs: leave its state (lastExportError_ included) alone.
+        if (outcome) *outcome = ExportOutcome::Busy;
+        return false;
+    }
+
+    // Clears a flag this call claimed on every way out, including an
+    // exception from the renderer (callBlocking throws when it can't reach
+    // the message thread).
+    struct RenderFlagGuard {
+        std::atomic<bool>& flag;
+        bool release;
+        ~RenderFlagGuard() { if (release) flag = false; }
+    } renderFlagGuard { renderInProgress_, !settings.renderClaimed };
+
+    lastExportError_.clear();
+    auto fail = [this](const QString& why) {
+        qWarning() << "[exportMix]" << why;
+        lastExportError_ = why;
+        return false;
+    };
 
     auto& transport = edit_->getTransport();
-    if (transport.isRecording()) {
-        qWarning() << "[exportMix] cannot export while recording";
-        return false;
-    }
+    if (transport.isRecording())
+        return fail("cannot export while recording");
 
-    if (!settings.destFile.getParentDirectory().isDirectory()) {
-        qWarning() << "[exportMix] output directory does not exist";
-        return false;
-    }
+    if (!settings.destFile.getParentDirectory().isDirectory())
+        return fail("output directory does not exist");
 
     bool allMuted = true;
     for (auto* track : te::getAudioTracks(*edit_)) {
         if (!track->isMuted(true)) { allMuted = false; break; }
     }
-    if (allMuted) {
-        qWarning() << "[exportMix] all tracks are muted, export would be silent";
-        return false;
-    }
-
-    renderInProgress_ = true;
+    if (allMuted)
+        return fail("all tracks are muted, export would be silent");
 
     if (transport.isPlaying())
         transport.stop(false, false);
 
+    // The live playback graph must not process the plugins while the render
+    // graph does (and re-initialises them at the render's rate): free it for
+    // the render and rebuild it afterwards. On the message thread this opens
+    // (or nests in) a render session; on a worker it relies on the caller's
+    // session, or opens one through callBlocking.
+    struct SessionGuard {
+        EditManager& em;
+        bool opened = false;
+        bool viaCallBlocking = false;
+        ~SessionGuard()
+        {
+            if (!opened) return;
+            if (!viaCallBlocking) { em.endRenderSession(); return; }
+            EditManager* target = &em;
+            if (!te::callBlockingCatching([target] { target->endRenderSession(); }))
+                QMetaObject::invokeMethod(target, [target] { target->endRenderSession(); },
+                                          Qt::QueuedConnection);
+        }
+    } session { *this };
+    if (juce::MessageManager::existsAndIsCurrentThread()) {
+        beginRenderSession();
+        session.opened = true;
+    } else if (!inRenderSession()) {
+        qWarning() << "[exportMix] no render session on a worker thread; opening one";
+        if (te::callBlockingCatching([this] { beginRenderSession(); })) {
+            session.opened = true;
+            session.viaCallBlocking = true;
+        }
+    }
+
     auto tracks = te::getAudioTracks(*edit_);
-    if (tracks.isEmpty()) { renderInProgress_ = false; return false; }
+    if (tracks.isEmpty())
+        return fail("the project has no tracks");
 
     // Tracks that are disconnected or play out of another output aren't part
     // of the mix (the render would otherwise sum every top-level track).
@@ -2797,11 +2991,13 @@ bool EditManager::exportMix(const ExportSettings& settings,
             tracksToDo.setBit(idx);
     }
     // An empty set would mean "every track" to the renderer.
-    if (tracksToDo.isZero()) { renderInProgress_ = false; return false; }
+    if (tracksToDo.isZero())
+        return fail("no track feeds the main mix");
 
     auto editLength = edit_->getLength();
-    if (editLength.inSeconds() <= 0.0) { renderInProgress_ = false; return false; }
     const bool hasRange = settings.range.getLength().inSeconds() > 0.0;
+    if (!hasRange && editLength.inSeconds() <= 0.0)
+        return fail("the project is empty");
 
     te::Renderer::Parameters params(*edit_);
     params.destFile = settings.destFile;
@@ -2812,6 +3008,8 @@ bool EditManager::exportMix(const ExportSettings& settings,
     params.time = hasRange ? settings.range
                            : tracktion::TimeRange(tracktion::TimePosition(),
                                                   tracktion::TimePosition::fromSeconds(editLength.inSeconds()));
+    if (settings.tailSeconds > 0.0)
+        params.endAllowance = tracktion::TimeDuration::fromSeconds(settings.tailSeconds);
     params.usePlugins = true;
     params.useMasterPlugins = settings.useMasterPlugins;
     params.canRenderInMono = false;
@@ -2838,27 +3036,26 @@ bool EditManager::exportMix(const ExportSettings& settings,
     if (settings.format == ExportFormat::OGG)
         renderParams.bitDepth = settings.oggQuality;
 
-    std::atomic<float> progress{0.0f};
-    auto task = std::make_unique<te::Renderer::RenderTask>(
-        "Exporting mix", renderParams, &progress, nullptr);
+    QString renderError;
+    try {
+        std::atomic<float> progress{0.0f};
+        auto task = std::make_unique<te::Renderer::RenderTask>(
+            "Exporting mix", renderParams, &progress, nullptr);
 
-    while (true) {
-        auto status = task->runJob();
-        float p = progress.load();
-        if (progressCallback) {
-            float scaledProgress = isMp3 ? p * 0.8f : p;
-            progressCallback(scaledProgress);
-        }
-        if (status == juce::ThreadPoolJob::jobHasFinished)
-            break;
+        juce::String loopError;
+        runRenderTaskToEnd(*task, progress,
+                           [&](float p) { if (progressCallback) progressCallback(isMp3 ? p * 0.8f : p); },
+                           loopError);
+        renderError = QString::fromStdString(
+            (loopError.isNotEmpty() ? loopError : task->errorMessage).toStdString());
+    } catch (const std::exception& e) {
+        renderError = QString::fromUtf8(e.what());
+        if (renderError.isEmpty()) renderError = "render failed";
     }
 
-    if (!task->errorMessage.isEmpty()) {
-        qWarning() << "[exportMix] render error:"
-                    << QString::fromStdString(task->errorMessage.toStdString());
-        renderInProgress_ = false;
+    if (!renderError.isEmpty()) {
         if (isMp3) renderDest.deleteFile();
-        return false;
+        return fail("render error: " + renderError);
     }
 
     // Measure the mix as written (before MP3 encoding changes it slightly).
@@ -2877,23 +3074,30 @@ bool EditManager::exportMix(const ExportSettings& settings,
             });
 
         renderDest.deleteFile();
-        renderInProgress_ = false;
 
-        if (!mp3ok) {
-            qWarning() << "[exportMix] MP3 transcode failed";
-            return false;
-        }
-        return settings.destFile.existsAsFile();
+        if (!mp3ok)
+            return fail("MP3 transcode failed");
     }
 
-    renderInProgress_ = false;
-    return settings.destFile.existsAsFile();
+    if (!settings.destFile.existsAsFile())
+        return fail("the render produced no file");
+    if (outcome) *outcome = ExportOutcome::Ok;
+    return true;
 }
 
 bool EditManager::feedsMainMix(te::AudioTrack* track) const
 {
     return track && !isTrackOutputDisconnected(track)
         && getTrackDirectOutputID(track).isEmpty();
+}
+
+void EditManager::adoptRecoveredEdit(const juce::File& originalFile)
+{
+    if (!edit_) return;
+    currentFile_ = originalFile;
+    edit_->editFileRetriever = [f = originalFile]() { return f; };
+    hasUnsavedChanges_ = true;
+    emitEditChanged();
 }
 
 QString EditManager::projectName() const
@@ -2978,6 +3182,29 @@ void EditManager::restoreStemMutes()
     savedMuteSolo_.clear();
 }
 
+std::vector<te::EditItemID> EditManager::busSources(te::AudioTrack* bus) const
+{
+    std::vector<te::EditItemID> sources;
+    if (!edit_ || !bus || !isBusTrack(bus)) return sources;
+    for (auto* t : getNonBusAudioTracks()) {
+        if (t->isMuted(false)) continue;
+        std::unordered_set<te::AudioTrack*> visited;
+        std::vector<te::AudioTrack*> pending { t };
+        bool reaches = false;
+        while (!pending.empty() && !reaches) {
+            auto* current = pending.back();
+            pending.pop_back();
+            if (!visited.insert(current).second) continue;
+            for (auto* next : downstreamTracks(current)) {
+                if (next == bus) { reaches = true; break; }
+                pending.push_back(next);
+            }
+        }
+        if (reaches) sources.push_back(t->itemID);
+    }
+    return sources;
+}
+
 bool EditManager::isTrackFrozen(te::AudioTrack* track) const
 {
     if (!track) return false;
@@ -3010,21 +3237,25 @@ void EditManager::freezeTrack(te::AudioTrack& track)
         }
     }
 
-    renderInProgress_ = true;
+    // Claimed and the live graph freed for the render (message thread); both
+    // end right after it.
+    std::optional<ScopedRenderClaim> claim;
+    claim.emplace(*this);
+    if (!claim->claimed()) return;
 
     auto& transport = edit_->getTransport();
     if (transport.isPlaying())
         transport.stop(false, false);
+    std::optional<ScopedRenderSession> session;
+    session.emplace(*this);
 
     int trackIdx = track.getIndexInEditTrackList();
     qDebug() << "[freezeTrack] track index:" << trackIdx
              << "name:" << QString::fromStdString(track.getName().toStdString());
 
     auto editLength = edit_->getLength();
-    if (editLength.inSeconds() <= 0.0) {
-        renderInProgress_ = false;
+    if (editLength.inSeconds() <= 0.0)
         return;
-    }
 
     auto projectDir = currentFile_.getParentDirectory();
     if (projectDir == juce::File())
@@ -3064,21 +3295,20 @@ void EditManager::freezeTrack(te::AudioTrack& track)
     if (!task->errorMessage.isEmpty()) {
         qWarning() << "[freezeTrack] RenderTask init error:"
                     << QString::fromStdString(task->errorMessage.toStdString());
-        renderInProgress_ = false;
         return;
     }
 
-    while (true) {
-        auto status = task->runJob();
-        if (status == juce::ThreadPoolJob::jobHasFinished)
-            break;
-    }
+    juce::String loopError;
+    runRenderTaskToEnd(*task, progress, {}, loopError);
 
-    renderInProgress_ = false;
+    const juce::String renderError = loopError.isNotEmpty() ? loopError : task->errorMessage;
+    task.reset();   // the render graph lets go of the plugins
+    session.reset();
+    claim.reset();
 
-    if (!task->errorMessage.isEmpty()) {
+    if (renderError.isNotEmpty()) {
         qWarning() << "[freezeTrack] render error:"
-                    << QString::fromStdString(task->errorMessage.toStdString());
+                    << QString::fromStdString(renderError.toStdString());
         freezeFile.deleteFile();
         return;
     }
@@ -3114,7 +3344,7 @@ void EditManager::freezeTrack(te::AudioTrack& track)
     qDebug() << "[freezeTrack] SUCCESS - frozen, file:" << freezeFile.getSize() << "bytes";
 
     emit trackFreezeStateChanged(&track);
-    emit tracksChanged();
+    emitTracksChanged();
     markDirtyAndNotify();
 }
 
@@ -3160,7 +3390,7 @@ void EditManager::unfreezeTrack(te::AudioTrack& track)
              << QString::fromStdString(track.getName().toStdString());
 
     emit trackFreezeStateChanged(&track);
-    emit tracksChanged();
+    emitTracksChanged();
     markDirtyAndNotify();
 }
 
@@ -3173,18 +3403,24 @@ bool EditManager::bounceTrackToAudio(te::AudioTrack& track)
         return false;
     }
 
-    renderInProgress_ = true;
+    // Claimed and the live graph freed for the render (message thread); both
+    // end right after it.
+    std::optional<ScopedRenderClaim> claim;
+    claim.emplace(*this);
+    if (!claim->claimed()) return false;
 
     auto& transport = edit_->getTransport();
     if (transport.isPlaying())
         transport.stop(false, false);
+    std::optional<ScopedRenderSession> session;
+    session.emplace(*this);
 
     auto editLength = edit_->getLength();
-    if (editLength.inSeconds() <= 0.0) { renderInProgress_ = false; return false; }
+    if (editLength.inSeconds() <= 0.0) return false;
 
     juce::BigInteger trackBit;
     int idx = track.getIndexInEditTrackList();
-    if (idx < 0) { renderInProgress_ = false; return false; }
+    if (idx < 0) return false;
     trackBit.setBit(idx);
 
     auto projectDir = currentFile_.getParentDirectory();
@@ -3212,18 +3448,16 @@ bool EditManager::bounceTrackToAudio(te::AudioTrack& track)
     auto task = std::make_unique<te::Renderer::RenderTask>(
         "Bouncing track", params, &progress, nullptr);
 
-    while (true) {
-        auto status = task->runJob();
-        if (status == juce::ThreadPoolJob::jobHasFinished)
-            break;
-    }
+    juce::String loopError;
+    const bool bounced = runRenderTaskToEnd(*task, progress, {}, loopError);
 
-    renderInProgress_ = false;
+    task.reset();
+    session.reset();
+    claim.reset();
 
-    if (!bounceFile.existsAsFile()) return false;
+    if (!bounced || !bounceFile.existsAsFile()) return false;
 
-    auto& um = edit_->getUndoManager();
-    um.beginNewTransaction("Bounce Track to Audio");
+    beginTransaction("Bounce Track to Audio");
 
     auto clips = track.getClips();
     for (int i = clips.size() - 1; i >= 0; --i)
@@ -3239,7 +3473,7 @@ bool EditManager::bounceTrackToAudio(te::AudioTrack& track)
 
     addAudioClipToTrack(track, bounceFile, 0.0);
 
-    emit tracksChanged();
+    emitTracksChanged();
     markDirtyAndNotify();
     return true;
 }

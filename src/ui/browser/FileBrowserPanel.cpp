@@ -1,5 +1,6 @@
 #include "FileBrowserPanel.h"
 #include "utils/ThemeManager.h"
+#include "engine/PatternManager.h"
 #include <QDir>
 #include <QStandardPaths>
 #include <QSignalBlocker>
@@ -13,6 +14,29 @@
 
 namespace OpenDaw {
 
+namespace {
+
+// "FL Studio Packs" (with the version when there are several installs) for an
+// FL Studio pack folder, otherwise the folder name.
+QString sampleRootLabel(const QString& root)
+{
+    const QString norm = QDir::fromNativeSeparators(root);
+    const int il = norm.indexOf("/Image-Line/", 0, Qt::CaseInsensitive);
+    if (il >= 0) {
+        const QString rest = norm.mid(il + int(qstrlen("/Image-Line/")));
+        const QString install = rest.section('/', 0, 0);   // "FL Studio 2024"
+        QString version = install;
+        version.remove(0, int(qstrlen("FL Studio")));
+        version = version.trimmed();
+        return version.isEmpty() ? QString("FL Studio Packs")
+                                 : QString("FL Studio %1 Packs").arg(version);
+    }
+    const QString name = QFileInfo(norm).fileName();
+    return name.isEmpty() ? QDir::toNativeSeparators(root) : name;
+}
+
+} // namespace
+
 FileBrowserPanel::FileBrowserPanel(juce::AudioDeviceManager& deviceManager,
                                    QWidget* parent)
     : QWidget(parent)
@@ -20,6 +44,11 @@ FileBrowserPanel::FileBrowserPanel(juce::AudioDeviceManager& deviceManager,
 {
     setAccessibleName("File Browser");
     auto& theme = ThemeManager::instance().current();
+    // The tree sits on a well a shade darker than the panel; selection uses the
+    // theme's selection colour (orange in Studio Orange).
+    const QColor treeBg = theme.isLight ? theme.background.darker(104)
+                                        : theme.background.darker(118);
+    const QString radius = QString::number(theme.cornerRadius);
 
     formatManager_.registerBasicFormats();
 
@@ -43,6 +72,26 @@ FileBrowserPanel::FileBrowserPanel(juce::AudioDeviceManager& deviceManager,
         QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation));
     locationCombo_->addItem("Home",
         QDir::homePath());
+    // Sample libraries (FL Studio packs, folders the user added): the places
+    // sample channels are usually picked from.
+    {
+        bool separated = false;
+        const QStringList roots = SampleLibrary::sampleRoots();
+        for (const QString& root : roots) {
+            bool known = false;
+            for (int i = 0; i < locationCombo_->count() && !known; ++i)
+                known = QDir(locationCombo_->itemData(i).toString()) == QDir(root);
+            if (known) continue;
+            if (!separated) {
+                locationCombo_->insertSeparator(locationCombo_->count());
+                separated = true;
+            }
+            const QString label = sampleRootLabel(root);
+            locationCombo_->addItem(label, root);
+            locationCombo_->setItemData(locationCombo_->count() - 1,
+                                        QDir::toNativeSeparators(root), Qt::ToolTipRole);
+        }
+    }
     // Shown when the current folder isn't one of the quick locations.
     locationCombo_->setPlaceholderText("Go to...");
 
@@ -59,8 +108,8 @@ FileBrowserPanel::FileBrowserPanel(juce::AudioDeviceManager& deviceManager,
     pathEdit_->setReadOnly(true);
     pathEdit_->setStyleSheet(
         QString("QLineEdit { background: %1; color: %2; border: 1px solid %3; "
-                "border-radius: 4px; font-size: 10px; padding: 3px 6px; }")
-            .arg(theme.background.name(), theme.textDim.name(), theme.border.name()));
+                "border-radius: %4px; font-size: 10px; padding: 3px 6px; }")
+            .arg(treeBg.name(), theme.textDim.name(), theme.separator.name(), radius));
     layout_->addWidget(pathEdit_);
 
     // Tree view with reduced indentation for deep hierarchies
@@ -83,15 +132,17 @@ FileBrowserPanel::FileBrowserPanel(juce::AudioDeviceManager& deviceManager,
 
     treeView_->setStyleSheet(
         QString("QTreeView { background: %1; color: %2; border: 1px solid %3; "
-                "border-radius: 4px; font-size: 11px; }"
-                "QTreeView::item { padding: 3px 0; }"
-                "QTreeView::item:selected { background: %4; border-radius: 3px; }"
-                "QTreeView::item:hover:!selected { background: %5; border-radius: 3px; }"
-                "QHeaderView::section { background: %6; color: %2; "
-                "border: none; border-bottom: 1px solid %3; padding: 4px 6px; "
+                "border-radius: %8px; font-size: 11px; outline: 0; }"
+                "QTreeView::item { padding: 2px 0; }"
+                "QTreeView::item:selected { background: %4; color: %7; }"
+                "QTreeView::item:hover:!selected { background: %5; }"
+                "QHeaderView::section { background: %6; color: %9; "
+                "border: none; border-bottom: 1px solid %3; padding: 3px 6px; "
                 "font-weight: bold; font-size: 10px; }")
-            .arg(theme.background.name(), theme.text.name(), theme.border.name(),
-                 theme.accent.name(), theme.surfaceLight.name(), theme.surface.name()));
+            .arg(treeBg.name(), theme.text.name(), theme.separator.name(),
+                 theme.selection.name(), theme.surfaceLight.name(), theme.dockTitle.name(),
+                 ThemeManager::readableTextOn(theme.selection).name(), radius,
+                 theme.dockTitleText.name()));
 
     connect(treeView_, &QTreeView::doubleClicked, this, [this](const QModelIndex& idx) {
         QString path = model_->filePath(idx);
@@ -147,8 +198,9 @@ void FileBrowserPanel::setupPreviewBar()
     previewBar_->setObjectName("previewBar");
     previewBar_->setStyleSheet(
         QString("QWidget#previewBar { background: %1; border: 1px solid %2; "
-                "border-radius: 4px; }")
-            .arg(theme.surface.name(), theme.border.name()));
+                "border-radius: %3px; }")
+            .arg(theme.surface.name(), theme.separator.name(),
+                 QString::number(theme.cornerRadius)));
 
     auto* previewLayout = new QVBoxLayout(previewBar_);
     previewLayout->setContentsMargins(8, 6, 8, 6);
@@ -168,11 +220,12 @@ void FileBrowserPanel::setupPreviewBar()
 
     QString btnStyle = QString(
         "QPushButton { background: %1; color: %2; border: 1px solid %3; "
-        "border-radius: 3px; font-size: 14px; padding: 2px 6px; min-width: 28px; }"
+        "border-radius: %6px; font-size: 14px; padding: 2px 6px; min-width: 28px; }"
         "QPushButton:hover { background: %4; }"
         "QPushButton:disabled { color: %5; }")
-        .arg(theme.surface.name(), theme.text.name(), theme.border.name(),
-             theme.surfaceLight.name(), theme.textDim.name());
+        .arg(theme.background.name(), theme.text.name(), theme.separator.name(),
+             theme.surfaceLight.name(), theme.textDim.name(),
+             QString::number(theme.cornerRadius));
 
     playPauseBtn_ = new QPushButton("\u25B6", previewBar_);
     playPauseBtn_->setAccessibleName("Play or Pause Preview");
@@ -240,7 +293,9 @@ void FileBrowserPanel::navigateTo(const QString& path)
 
     int match = -1;
     for (int i = 0; i < locationCombo_->count(); ++i) {
-        if (QDir(locationCombo_->itemData(i).toString()) == QDir(path)) {
+        const QString item = locationCombo_->itemData(i).toString();
+        if (item.isEmpty()) continue;   // separator
+        if (QDir(item) == QDir(path)) {
             match = i;
             break;
         }

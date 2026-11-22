@@ -164,6 +164,13 @@ namespace mi {
     inline const QChar HighlightAlt      {0xEF52};
     inline const QChar Check             {0xE5CA};
     inline const QChar Close             {0xE5CD};
+    inline const QChar ContentCopy       {0xE14D};
+    inline const QChar Edit              {0xE3C9};
+    inline const QChar GridOn            {0xE3EC};
+    inline const QChar ViewList          {0xE8EF};
+    inline const QChar Piano             {0xE521};
+    inline const QChar Palette           {0xE40A};
+    inline const QChar OpenInNew         {0xE89E};
 }
 
 } // namespace icons

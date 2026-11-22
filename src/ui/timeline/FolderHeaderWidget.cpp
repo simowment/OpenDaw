@@ -6,6 +6,7 @@
 #include <QLineEdit>
 #include <QPainter>
 #include <QMenu>
+#include <QPointer>
 
 namespace OpenDaw {
 
@@ -141,13 +142,20 @@ void FolderHeaderWidget::paintEvent(QPaintEvent* event)
 
 void FolderHeaderWidget::refresh()
 {
-    if (nameLabel_)
-        nameLabel_->setText(editMgr_->getFolderName(folderId_));
+    // TimelineView keeps folder headers across rebuilds and calls this, so
+    // only touch what changed.
+    if (nameLabel_) {
+        const QString name = editMgr_->getFolderName(folderId_);
+        if (nameLabel_->text() != name)
+            nameLabel_->setText(name);
+    }
     collapsed_ = editMgr_->isFolderCollapsed(folderId_);
-    if (collapseBtn_)
-        collapseBtn_->setText(collapsed_
-            ? QString::fromUtf8("\xe2\x96\xb8")
-            : QString::fromUtf8("\xe2\x96\xbe"));
+    if (collapseBtn_) {
+        const QString arrow = collapsed_ ? QString::fromUtf8("\xe2\x96\xb8")
+                                         : QString::fromUtf8("\xe2\x96\xbe");
+        if (collapseBtn_->text() != arrow)
+            collapseBtn_->setText(arrow);
+    }
 }
 
 void FolderHeaderWidget::toggleMuteAll()
@@ -203,18 +211,23 @@ void FolderHeaderWidget::startRenameEdit()
 
     int fid = folderId_;
     auto* mgr = editMgr_;
-    auto* nameLbl = nameLabel_;
+    QPointer<QLabel> nameLbl = nameLabel_;
 
     connect(edit, &QLineEdit::editingFinished, edit, [edit, fid, mgr, nameLbl]() {
         QString newName = edit->text().trimmed();
         edit->hide();
         edit->deleteLater();
+        // The header survives the rename (TimelineView no longer rebuilds
+        // every header), so bring its label back here.
+        if (nameLbl) {
+            if (!newName.isEmpty())
+                nameLbl->setText(newName);
+            nameLbl->show();
+        }
         if (!newName.isEmpty()) {
             QTimer::singleShot(0, mgr, [fid, mgr, newName]() {
                 mgr->renameFolder(fid, newName);
             });
-        } else if (nameLbl) {
-            nameLbl->show();
         }
     });
 }

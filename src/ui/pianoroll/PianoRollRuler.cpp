@@ -62,6 +62,23 @@ void PianoRollRuler::paintEvent(QPaintEvent*)
         }
     }
 
+    if (regionBeats_ > 0.0) {
+        const QColor c = regionColour_.isValid() ? regionColour_ : theme.accent;
+        const double rx = regionBeats_ * pixelsPerBeat_ - scrollX_;
+        if (rx > 0) {
+            QColor band = c;
+            band.setAlpha(150);
+            p.fillRect(QRectF(0, 0, std::min<double>(rx, width()), 3), band);
+        }
+        if (rx < width())
+            p.fillRect(QRectF(std::max(0.0, rx), 0, width() - std::max(0.0, rx), h),
+                       QColor(0, 0, 0, 70));
+        if (rx >= -2 && rx <= width() + 2) {
+            p.setPen(QPen(c, 2));
+            p.drawLine(QPointF(rx, 0), QPointF(rx, h));
+        }
+    }
+
     double cx = cursorBeat_ * pixelsPerBeat_ - scrollX_;
     if (cx >= -6 && cx <= width() + 6) {
         QColor cursorColor(0, 220, 110);

@@ -64,7 +64,19 @@ PianoRollEditor::PianoRollEditor(QWidget* parent)
     clipNameLabel_->setStyleSheet(
         QString("color: %1; font-weight: bold; font-size: 11px;")
             .arg(theme.text.name()));
+    clipNameLabel_->setTextFormat(Qt::RichText);
     tbLayout->addWidget(clipNameLabel_);
+
+    patternHintLabel_ = new QLabel(toolbar);
+    patternHintLabel_->setAccessibleName("Pattern Edit Hint");
+    patternHintLabel_->setText("edits update every placement");
+    patternHintLabel_->setToolTip(
+        "You are editing the pattern itself: every placement of it in the playlist "
+        "plays these notes, and the Channel Rack steps follow them.");
+    patternHintLabel_->setStyleSheet(
+        QString("color: %1; font-size: 10px; padding-left: 6px;").arg(theme.textDim.name()));
+    patternHintLabel_->setVisible(false);
+    tbLayout->addWidget(patternHintLabel_);
 
     tbLayout->addStretch();
 
@@ -569,10 +581,42 @@ PianoRollEditor::PianoRollEditor(QWidget* parent)
 
     onSnapModeChanged(6);
     noteGrid_->setEditMode(NoteGrid::EditMode::Edit);
+    // Focusing the editor (F7, raising the dock) focuses the grid, so
+    // musical typing works straight away.
+    setFocusProxy(noteGrid_);
 }
 
 void PianoRollEditor::setClip(te::MidiClip* clip, EditManager* editMgr)
 {
+    pattern_ = PatternContext{};
+    loadClip(clip, editMgr);
+}
+
+void PianoRollEditor::setPatternClip(te::MidiClip* clip, EditManager* editMgr,
+                                     const PatternContext& ctx)
+{
+    pattern_ = ctx;
+    loadClip(clip, editMgr);
+}
+
+void PianoRollEditor::updatePatternContext(const PatternContext& ctx)
+{
+    if (!isShowingPattern() || ctx.patternId != pattern_.patternId
+        || ctx.trackId != pattern_.trackId)
+        return;
+    const bool lengthChanged = std::abs(ctx.lengthBeats - pattern_.lengthBeats) > 1.0e-9;
+    pattern_ = ctx;
+    if (lengthChanged) {
+        noteGrid_->setFixedLengthBeats(pattern_.lengthBeats);
+        velocityLane_->refresh();
+        ccLane_->refresh();
+    }
+    updateHeader();
+}
+
+void PianoRollEditor::loadClip(te::MidiClip* clip, EditManager* editMgr)
+{
+    noteGrid_->stopAllPreviews();
     clip_ = clip;
     if (editMgr && editMgr != editMgr_)
         connect(editMgr, &EditManager::tracksChanged, this, &PianoRollEditor::updateDrumNames,
@@ -580,24 +624,110 @@ void PianoRollEditor::setClip(te::MidiClip* clip, EditManager* editMgr)
     editMgr_ = editMgr;
     track_ = nullptr;
     linkedClips_.clear();
-    hiddenChannels_.clear();
+    if (!hiddenChannels_.empty()) {
+        for (int ch : hiddenChannels_)
+            noteGrid_->setChannelVisible(ch, true);
+        hiddenChannels_.clear();
+    }
 
     if (clip) {
         track_ = clip->getAudioTrack();
         activeChannel_ = clip->getMidiChannel().getChannelNumber();
         if (activeChannel_ < 1) activeChannel_ = 1;
-
         gatherLinkedClips();
-
-        clipNameLabel_->setText(
-            QString::fromStdString(clip->getName().toStdString()));
     } else {
-        clipNameLabel_->setText("No clip selected");
+        if (isShowingPattern() && editMgr_)
+            track_ = editMgr_->findAudioTrack(pattern_.trackId);
+        activeChannel_ = 1;
     }
+
+    // A pattern channel is one clip per channel: no linked MIDI channels.
+    channelScrollArea_->setVisible(!isShowingPattern());
+    noteGrid_->setFixedLengthBeats(isShowingPattern() ? pattern_.lengthBeats : 0.0);
+    noteGrid_->setClipOnDemand(isShowingPattern() && !clip && track_ && patternClipFactory_);
 
     passClipsToChildren();
     rebuildChannelPanel();
+    applyPreviewTarget();
+    updateHeader();
     updateDrumNames();
+}
+
+void PianoRollEditor::setPreviewTrack(te::AudioTrack* track)
+{
+    if (previewTrack_ == track) return;
+    previewTrack_ = track;
+    applyPreviewTarget();
+    if (!clip_) {
+        updateHeader();
+        updateDrumNames();
+    }
+}
+
+te::AudioTrack* PianoRollEditor::targetTrack() const
+{
+    if (clip_ && (!editMgr_ || editMgr_->isClipValid(clip_)))
+        if (auto* t = clip_->getAudioTrack())
+            return t;
+    if (isShowingPattern() && track_ && editMgr_
+        && editMgr_->findAudioTrack(pattern_.trackId) == track_)
+        return track_;
+    return previewTrack_.get();
+}
+
+void PianoRollEditor::applyPreviewTarget()
+{
+    // Used only while no clip is loaded (the grid prefers the clip's track).
+    te::AudioTrack* target = nullptr;
+    if (isShowingPattern() && track_)
+        target = track_;
+    else
+        target = previewTrack_.get();
+    noteGrid_->setPreviewTarget(target, activeChannel_);
+}
+
+void PianoRollEditor::clear()
+{
+    noteGrid_->stopAllPreviews();
+    previewTrack_ = nullptr;
+    noteGrid_->setPreviewTarget(nullptr);
+    setClip(nullptr, nullptr);
+}
+
+void PianoRollEditor::updateHeader()
+{
+    auto& theme = ThemeManager::instance().current();
+    const auto esc = [](const QString& t) { return t.toHtmlEscaped(); };
+    if (isShowingPattern()) {
+        const QColor c = pattern_.colour.isValid() ? pattern_.colour : theme.accent;
+        clipNameLabel_->setText(
+            QString("<span style=\"color:%1;\">&#9632;</span> Pattern: "
+                    "<span style=\"color:%1;\">%2</span> &mdash; Channel: %3")
+                .arg(c.name(), esc(pattern_.patternName), esc(pattern_.channelName)));
+        clipNameLabel_->setToolTip(
+            QString("Editing channel \"%1\" of pattern \"%2\". Every placement of the "
+                    "pattern in the playlist updates.")
+                .arg(pattern_.channelName, pattern_.patternName));
+        patternHintLabel_->setText(clip_ ? QString("edits update every placement")
+                                         : QString("draw or type notes to fill the pattern"));
+        patternHintLabel_->setVisible(true);
+        ruler_->setRegion(pattern_.lengthBeats, c);
+        return;
+    }
+    patternHintLabel_->setVisible(false);
+    clipNameLabel_->setToolTip({});
+    if (clip_) {
+        clipNameLabel_->setText(esc(QString::fromStdString(clip_->getName().toStdString())));
+        ruler_->setRegion(noteGrid_->regionLengthBeats());
+    } else if (auto* t = previewTrack_.get()) {
+        clipNameLabel_->setText(
+            QString("No clip selected &mdash; the keys play <b>%1</b>")
+                .arg(esc(QString::fromStdString(t->getName().toStdString()))));
+        ruler_->setRegion(0.0);
+    } else {
+        clipNameLabel_->setText("No clip selected");
+        ruler_->setRegion(0.0);
+    }
 }
 
 void PianoRollEditor::updateDrumNames()
@@ -605,7 +735,7 @@ void PianoRollEditor::updateDrumNames()
     // Drum names when the track plays a drum kit: a built-in kit, channel 10
     // of the built-in instrument in General MIDI mode, or a drum VST.
     bool drums = false;
-    auto* track = clip_ && editMgr_ && editMgr_->isClipValid(clip_) ? clip_->getAudioTrack() : nullptr;
+    auto* track = editMgr_ ? targetTrack() : nullptr;
     if (track) {
         if (auto* inst = editMgr_->getTrackInstrument(track)) {
             if (auto* sf = dynamic_cast<SoundFontPlugin*>(inst))
@@ -675,6 +805,7 @@ void PianoRollEditor::setActiveChannel(int channelNumber)
         ccLane_->setClip(newPrimary);
     }
 
+    applyPreviewTarget();
     rebuildChannelPanel();
     updateDrumNames();
 }
@@ -684,6 +815,18 @@ te::MidiClip* PianoRollEditor::ensureClipForActiveChannel()
     for (auto* mc : linkedClips_) {
         if (mc->getMidiChannel().getChannelNumber() == activeChannel_)
             return mc;
+    }
+
+    // A pattern channel with no clip yet: the first note makes it.
+    if (isShowingPattern()) {
+        if (clip_) return clip_;
+        if (!patternClipFactory_ || !track_) return nullptr;
+        auto* made = patternClipFactory_(pattern_.patternId, pattern_.trackId);
+        if (!made || (editMgr_ && !editMgr_->isClipValid(made))) return nullptr;
+        // The factory's signals may already have reloaded the editor.
+        if (clip_ != made && isShowingPattern())
+            loadClip(made, editMgr_);
+        return clip_ == made ? made : nullptr;
     }
 
     if (!editMgr_ || !track_ || linkedClips_.empty()) return nullptr;
@@ -703,9 +846,16 @@ te::MidiClip* PianoRollEditor::ensureClipForActiveChannel()
 
 void PianoRollEditor::dropStaleClips()
 {
+    if (isShowingPattern() && editMgr_ && !editMgr_->findAudioTrack(pattern_.trackId)) {
+        setClip(nullptr, editMgr_);       // the channel itself is gone
+        return;
+    }
     if (!clip_ || !editMgr_) return;
     if (!editMgr_->isClipValid(clip_)) {
-        setClip(nullptr, nullptr);
+        if (isShowingPattern())
+            loadClip(nullptr, editMgr_);  // the placement went: back to the empty channel
+        else
+            setClip(nullptr, nullptr);
         return;
     }
     // A linked channel clip can vanish on its own (undo, timeline delete).
@@ -736,6 +886,8 @@ void PianoRollEditor::refresh()
     velocityLane_->repaint();
     ccLane_->setPixelsPerBeat(noteGrid_->pixelsPerBeat());
     ccLane_->refresh();
+    if (!isShowingPattern())
+        ruler_->setRegion(noteGrid_->regionLengthBeats());
 }
 
 void PianoRollEditor::syncKeyboardScroll()
@@ -799,6 +951,8 @@ void PianoRollEditor::onNotesChanged()
     ccLane_->setPixelsPerBeat(noteGrid_->pixelsPerBeat());
     ccLane_->setScrollOffset(noteGrid_->horizontalScrollBar()->value());
     ccLane_->refresh();
+    if (!isShowingPattern() && clip_)
+        ruler_->setRegion(noteGrid_->regionLengthBeats());
     emit notesChanged();
 }
 

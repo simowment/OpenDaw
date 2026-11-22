@@ -202,13 +202,19 @@ int main(int argc, char* argv[])
         app.mainWindow()->loadFile(fileToLoad);
     }
 
-    splash->finish();
-    splash->update();
-
+    // The window is up: fade the splash out on its own (no click needed) and
+    // hand focus to the main window.
     QObject::connect(splash, &OpenDaw::SplashScreen::dismissed, splash, [&]() {
-        app.mainWindow()->raise();
-        app.mainWindow()->activateWindow();
+        if (auto* w = app.mainWindow()) {
+            w->raise();
+            w->activateWindow();
+        }
     });
+    splash->finishAndClose();
+    if (auto* w = app.mainWindow()) {
+        w->raise();
+        w->activateWindow();
+    }
 
     return qtApp.exec();
 }

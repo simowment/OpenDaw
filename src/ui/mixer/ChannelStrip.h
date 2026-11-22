@@ -4,6 +4,7 @@
 #include "ui/controls/VolumeFader.h"
 #include "ui/controls/RotaryKnob.h"
 #include "ui/controls/LevelMeter.h"
+#include "ui/ViewRefreshSupport.h"
 #include <QWidget>
 #include <QVBoxLayout>
 #include <QPushButton>
@@ -20,8 +21,10 @@ class ChannelStrip : public QWidget {
     Q_OBJECT
 
 public:
+    // `routing` is the rebuild's shared input/output list (queried here when null).
     ChannelStrip(te::AudioTrack* track, EditManager* editMgr,
-                 QWidget* parent = nullptr);
+                 QWidget* parent = nullptr,
+                 const TrackRoutingChoices* routing = nullptr);
     ~ChannelStrip() override;
 
     static ChannelStrip* createMasterStrip(EditManager* editMgr,
@@ -30,7 +33,17 @@ public:
     QSize sizeHint() const override { return {92, 400}; }
 
     te::AudioTrack* track() const { return track_; }
-    void refresh();
+    // False once the track object was destroyed (or after detach()): the
+    // strip then never dereferences track_.
+    bool trackAlive() const { return track_ && trackRef_.get() != nullptr; }
+    // The track's EditItemID (kept after detach()).
+    uint64_t trackId() const { return trackId_; }
+    // The kind of track this strip was built for (MIDI strips have an
+    // instrument row); MixerView recreates a strip whose track changed kind.
+    TrackWidgetKind kind() const { return kind_; }
+    // Re-reads the track. Without `routing` the input/output combos only
+    // reselect the current entry; with it their item lists are updated too.
+    void refresh(const TrackRoutingChoices* routing = nullptr);
     // Called before deleteLater(): stop touching the (possibly deleted) track.
     void detach();
     void setSelected(bool selected);
@@ -47,7 +60,7 @@ private:
     static constexpr int kInstrumentRowHeight = 19;
     QColor stripColour() const;
     void applyNameStyle();
-    void setupUI();
+    void setupUI(const TrackRoutingChoices* routing);
     void setupMasterUI();
     void updateMeter();
     void reconnectLevelMeterSource();
@@ -57,9 +70,10 @@ private:
     void updateAutoModeButton();
     void updateVolumeLabel();
     void startVolumeEdit();
-    void populateInputCombo();
+    void populateInputCombo(const TrackRoutingChoices* routing);
     void onInputComboChanged(int index);
-    void populateOutputCombo();
+    void populateOutputCombo(const TrackRoutingChoices* routing);
+    void updateInstrumentButton();
     void onOutputComboChanged(int index);
     void updateSendsButton();
     void onArmToggled(bool armed);
@@ -67,7 +81,9 @@ private:
     void startRenameEdit();
 
     te::AudioTrack* track_ = nullptr;
+    juce::WeakReference<te::Selectable> trackRef_;
     uint64_t trackId_ = 0;
+    TrackWidgetKind kind_ = TrackWidgetKind::Audio;
     EditManager* editMgr_;
     bool isMaster_ = false;
     bool selected_ = false;
@@ -92,6 +108,10 @@ private:
     QTimer meterTimer_;
     te::LevelMeasurer::Client meterClient_;
     te::LevelMeterPlugin* levelMeterPlugin_ = nullptr;
+    // Guards levelMeterPlugin_: a strip now outlives tracksChanged, and the
+    // meter plugin can go (plugin list rebuilt, track deleted) while it does.
+    juce::WeakReference<te::Selectable> levelMeterRef_;
+    void dropLevelMeterClient();
     double lastTrackedPlayheadSecs_ = -1.0;
 
 };

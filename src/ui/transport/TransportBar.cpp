@@ -1,5 +1,8 @@
 #include "TransportBar.h"
+#include "engine/PatternManager.h"
+#include "ui/controls/RotaryKnob.h"
 #include "ui/timeline/GridSnapper.h"
+#include "ui/toolbar/PatternSelector.h"
 #include "utils/ThemeManager.h"
 #include "utils/IconFont.h"
 #include <QDialog>
@@ -8,18 +11,33 @@
 #include <QMenu>
 #include <QActionGroup>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <functional>
 #include <QVBoxLayout>
+#include <algorithm>
 #include <cmath>
 
 namespace OpenDaw {
 
-TransportBar::TransportBar(EditManager* editMgr, QWidget* parent)
-    : QWidget(parent), editMgr_(editMgr),
+namespace {
+// Master volume knob: linear in dB from -60 to +6, like the mixer's master fader.
+double masterDbToKnob(float db)
+{
+    return std::clamp((double(db) + 60.0) / 66.0, 0.0, 1.0);
+}
+float knobToMasterDb(double v)
+{
+    return v <= 0.001 ? -100.0f : float(-60.0 + v * 66.0);
+}
+} // namespace
+
+TransportBar::TransportBar(EditManager* editMgr, PatternManager* patterns,
+                           PatternPlayer* player, QWidget* parent)
+    : QWidget(parent), editMgr_(editMgr), patterns_(patterns), player_(player),
       deferredLoopActivation_(editMgr->loopActivationDeferred())
 {
     setAccessibleName("Transport Bar");
-    setFixedHeight(58);
+    setFixedHeight(kBarHeight);
 
     auto& theme = ThemeManager::instance().current();
     setAutoFillBackground(true);
@@ -28,13 +46,13 @@ TransportBar::TransportBar(EditManager* editMgr, QWidget* parent)
     setPalette(pal);
 
     auto* layout = new QHBoxLayout(this);
-    layout->setContentsMargins(10, 6, 10, 6);
-    layout->setSpacing(6);
+    layout->setContentsMargins(6, 3, 6, 3);
+    layout->setSpacing(4);
 
-    const QFont iconFont = icons::fontAudio(17);
+    const QFont iconFont = icons::fontAudio(15);
     // Every button and box in the row shares one height, so they line up.
-    constexpr int kRowHeight = 34;
-    const QSize transportButtonSize(38, kRowHeight);
+    constexpr int kRowHeight = 28;
+    const QSize transportButtonSize(32, kRowHeight);
 
     auto makeTransportBtn = [&](const QChar& glyph, const QString& name,
                                 const QColor& activeColor, bool checkable = false) {
@@ -44,6 +62,7 @@ TransportBar::TransportBar(EditManager* editMgr, QWidget* parent)
         btn->setFont(iconFont);
         btn->setCheckable(checkable);
         btn->setFixedSize(transportButtonSize);
+        btn->setFocusPolicy(Qt::NoFocus);
         applyButtonStyle(btn, activeColor);
         return btn;
     };
@@ -56,10 +75,18 @@ TransportBar::TransportBar(EditManager* editMgr, QWidget* parent)
         return sep;
     };
 
+    // ── Pattern | Song ──
+    buildModeToggle(layout);
+    layout->addWidget(makeSeparator());
+
     // ── Transport buttons ──
     rtzBtn_    = makeTransportBtn(icons::fa::Prev,   "Return to Start", theme.text);
     stopBtn_   = makeTransportBtn(icons::fa::Stop,   "Stop",   theme.transportStop);
-    playBtn_   = makeTransportBtn(icons::fa::Play,   "Play (Space)",   theme.transportPlay, true);
+    playBtn_   = makeTransportBtn(icons::fa::Play,
+                                  "Play (Space): loops the current pattern in Pattern mode, "
+                                  "plays the playlist in Song mode",
+                                  theme.transportPlay, true);
+    playBtn_->setAccessibleName("Play");
     recordBtn_ = makeTransportBtn(icons::fa::Record, "Record (R)", theme.transportRecord, true);
     loopBtn_   = makeTransportBtn(icons::fa::Loop,   "Loop", theme.accent, true);
     metronomeBtn_ = makeTransportBtn(icons::fa::Metronome, "Metronome", theme.accent, true);
@@ -78,13 +105,14 @@ TransportBar::TransportBar(EditManager* editMgr, QWidget* parent)
                           "with the arrow).");
     punchBtn_->setCheckable(true);
     punchBtn_->setPopupMode(QToolButton::MenuButtonPopup);
-    punchBtn_->setFixedSize(74, kRowHeight);
+    punchBtn_->setFixedSize(66, kRowHeight);
+    punchBtn_->setFocusPolicy(Qt::NoFocus);
     {
         const QColor& active = theme.transportRecord;
         const QColor checkedText = active.lightnessF() > 0.6 ? QColor(20, 20, 22) : QColor(Qt::white);
         punchBtn_->setStyleSheet(
             QString("QToolButton { background: %1; color: %2; border: 1px solid %3; "
-                    "border-radius: 4px; font-weight: bold; font-size: 10px; padding-right: 12px; }"
+                    "border-radius: %10px; font-weight: bold; font-size: 10px; padding-right: 12px; }"
                     "QToolButton:hover { background: %4; border-color: %5; }"
                     "QToolButton:checked { background: %6; color: %8; border-color: %7; }"
                     "QToolButton::menu-button { border: none; width: 14px; }"
@@ -92,7 +120,8 @@ TransportBar::TransportBar(EditManager* editMgr, QWidget* parent)
                 .arg(theme.background.name(), theme.text.name(), theme.separator.name(),
                      theme.surfaceLight.name(), theme.border.name(),
                      active.name(), active.darker(130).name(), checkedText.name(),
-                     ThemeManager::dropDownArrowPath(theme.text)));
+                     ThemeManager::dropDownArrowPath(theme.text))
+                .arg(theme.cornerRadius));
     }
     buildPunchMenu();
     punchBtn_->setChecked(editMgr_->isPunchEnabled());
@@ -112,7 +141,8 @@ TransportBar::TransportBar(EditManager* editMgr, QWidget* parent)
     countInBtn_->setAccessibleName("Count-In Before Recording");
     countInBtn_->setToolTip("Count-in before recording");
     countInBtn_->setCheckable(true);
-    countInBtn_->setFixedSize(72, kRowHeight);
+    countInBtn_->setFixedSize(62, kRowHeight);
+    countInBtn_->setFocusPolicy(Qt::NoFocus);
     applyButtonStyle(countInBtn_, theme.accent);
 
     countInCombo_ = new QComboBox(this);
@@ -122,28 +152,33 @@ TransportBar::TransportBar(EditManager* editMgr, QWidget* parent)
     countInCombo_->addItem("2 Bars", 2);
     countInCombo_->addItem("1 Beat", 4);
     countInCombo_->addItem("2 Beats", 3);
-    countInCombo_->setFixedSize(84, kRowHeight);
+    countInCombo_->setFixedSize(78, kRowHeight);
+    countInCombo_->setFocusPolicy(Qt::NoFocus);
     countInCombo_->setEnabled(false);
 
     panicBtn_ = new QPushButton(this);
     panicBtn_->setAccessibleName("MIDI Panic - Stop All Notes");
     panicBtn_->setToolTip("MIDI panic: stop all notes and reset (Ctrl+Shift+P)");
     panicBtn_->setText("PANIC");
-    panicBtn_->setFixedSize(58, kRowHeight);
+    panicBtn_->setFixedSize(48, kRowHeight);
+    panicBtn_->setFocusPolicy(Qt::NoFocus);
     panicBtn_->setStyleSheet(
         QString("QPushButton { background: %1; color: %2; border: 1px solid %3; "
-                "border-radius: 4px; font-size: 9px; font-weight: bold; letter-spacing: 1px; }"
+                "border-radius: %5px; font-size: 9px; font-weight: bold; letter-spacing: 1px; "
+                "padding: 0px; }"
                 "QPushButton:hover { color: %4; border-color: %4; }"
                 "QPushButton:pressed { background: %4; color: white; }")
             .arg(theme.background.name(), theme.textDim.name(),
-                 theme.border.name(), theme.recordArm.name()));
+                 theme.border.name(), theme.recordArm.name())
+            .arg(theme.cornerRadius));
 
-    engineBtn_ = new QPushButton(this);
+    engineBtn_ = new QPushButton(icons::fa::Powerswitch, this);
     engineBtn_->setAccessibleName("Audio Engine Toggle");
-    engineBtn_->setToolTip("Audio engine: click to turn off/on");
+    engineBtn_->setFont(iconFont);
     engineBtn_->setCheckable(true);
-    engineBtn_->setChecked(true);
-    engineBtn_->setFixedSize(88, kRowHeight);
+    engineBtn_->setChecked(!editMgr_->isEngineSuspended());
+    engineBtn_->setFixedSize(transportButtonSize);
+    engineBtn_->setFocusPolicy(Qt::NoFocus);
     updateEngineButtonStyle();
 
     connect(rtzBtn_,       &QPushButton::clicked, this, [this]() {
@@ -151,7 +186,7 @@ TransportBar::TransportBar(EditManager* editMgr, QWidget* parent)
         editMgr_->transport().setPosition(tracktion::TimePosition::fromSeconds(0.0));
     });
     connect(stopBtn_,      &QPushButton::clicked, this, &TransportBar::onStop);
-    connect(playBtn_,      &QPushButton::clicked, this, &TransportBar::onPlay);
+    connect(playBtn_,      &QPushButton::clicked, this, &TransportBar::togglePlay);
     connect(recordBtn_,    &QPushButton::clicked, this, &TransportBar::onRecord);
     connect(loopBtn_,      &QPushButton::clicked, this, &TransportBar::onLoop);
     connect(metronomeBtn_, &QPushButton::clicked, this, &TransportBar::onMetronome);
@@ -165,26 +200,20 @@ TransportBar::TransportBar(EditManager* editMgr, QWidget* parent)
     layout->addWidget(stopBtn_);
     layout->addWidget(playBtn_);
     layout->addWidget(recordBtn_);
-    layout->addSpacing(6);
-    layout->addWidget(loopBtn_);
-    layout->addWidget(punchBtn_);
-    layout->addWidget(metronomeBtn_);
-    layout->addWidget(countInBtn_);
-    layout->addWidget(countInCombo_);
-    layout->addSpacing(4);
     layout->addWidget(makeSeparator());
-    layout->addSpacing(4);
 
-    // ── Counter: bars|beats large, min:sec underneath ──
+    // ── Counter: bars|beats large, min:sec (or the playing pattern) underneath ──
+    constexpr int kDisplayHeight = 34;
     auto* counter = new QFrame(this);
     counter->setObjectName("transportCounter");
-    counter->setFixedSize(172, 46);
+    counter->setFixedSize(150, kDisplayHeight);
     counter->setStyleSheet(
         QString("QFrame#transportCounter { background: %1; border: 1px solid %2; "
-                "border-radius: 5px; }")
-            .arg(theme.lcdBackground.name(), theme.separator.name()));
+                "border-radius: %3px; }")
+            .arg(theme.lcdBackground.name(), theme.separator.name())
+            .arg(theme.cornerRadius));
     auto* counterLayout = new QVBoxLayout(counter);
-    counterLayout->setContentsMargins(10, 2, 10, 3);
+    counterLayout->setContentsMargins(8, 1, 8, 1);
     counterLayout->setSpacing(0);
 
     beatLabel_ = new QLabel("1 | 1 | 000", counter);
@@ -192,8 +221,8 @@ TransportBar::TransportBar(EditManager* editMgr, QWidget* parent)
     beatLabel_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     beatLabel_->setStyleSheet(
         QString("QLabel { color: %1; background: transparent; "
-                "font-family: 'Consolas', 'Cascadia Mono', monospace; "
-                "font-size: 21px; font-weight: bold; }")
+                "font-family: 'Consolas', 'Cascadia Mono', 'Menlo', monospace; "
+                "font-size: 17px; font-weight: bold; }")
             .arg(theme.lcdText.name()));
 
     positionLabel_ = new QLabel("0:00.000", counter);
@@ -201,44 +230,44 @@ TransportBar::TransportBar(EditManager* editMgr, QWidget* parent)
     positionLabel_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     positionLabel_->setStyleSheet(
         QString("QLabel { color: %1; background: transparent; "
-                "font-family: 'Consolas', 'Cascadia Mono', monospace; font-size: 11px; }")
+                "font-family: 'Consolas', 'Cascadia Mono', 'Menlo', monospace; font-size: 9px; }")
             .arg(theme.textDim.name()));
 
     counterLayout->addWidget(beatLabel_);
     counterLayout->addWidget(positionLabel_);
     layout->addWidget(counter);
-    layout->addSpacing(8);
 
     // ── Tempo, meter, grid: a second display panel beside the counter ──
     auto* info = new QFrame(this);
     info->setObjectName("transportInfo");
-    info->setFixedHeight(counter->height());
+    info->setFixedHeight(kDisplayHeight);
     const QColor& lcd = theme.lcdText;
     auto lcdAlpha = [&](int a) {
         return QString("rgba(%1,%2,%3,%4)").arg(lcd.red()).arg(lcd.green()).arg(lcd.blue()).arg(a);
     };
     info->setStyleSheet(
-        QString("QFrame#transportInfo { background: %1; border: 1px solid %2; border-radius: 5px; }"
-                "QLabel { color: %3; background: transparent; font-size: 9px; "
+        QString("QFrame#transportInfo { background: %1; border: 1px solid %2; border-radius: %9px; }"
+                "QLabel { color: %3; background: transparent; font-size: 8px; "
                 "  font-weight: bold; letter-spacing: 1px; }"
-                "QLabel#meterSlash { font-size: 14px; letter-spacing: 0px; }"
+                "QLabel#meterSlash { font-size: 12px; letter-spacing: 0px; }"
                 "QAbstractSpinBox, QComboBox { background: transparent; color: %4; "
-                "  border: 1px solid transparent; border-radius: 3px; padding: 0px 3px; "
-                "  min-height: 0px; font-family: 'Consolas', 'Cascadia Mono', monospace; "
-                "  font-size: 14px; font-weight: bold; }"
+                "  border: 1px solid transparent; border-radius: 2px; padding: 0px 3px; "
+                "  min-height: 0px; font-family: 'Consolas', 'Cascadia Mono', 'Menlo', monospace; "
+                "  font-size: 13px; font-weight: bold; }"
                 "QAbstractSpinBox:hover, QComboBox:hover { background: %5; border-color: %6; }"
                 "QAbstractSpinBox:focus { border-color: %7; }"
                 "QComboBox::drop-down { border: none; width: 12px; }"
                 "QComboBox::down-arrow { image: url(%8); width: 9px; height: 6px; }")
             .arg(theme.lcdBackground.name(), theme.separator.name(), lcdAlpha(150),
                  lcd.name(), lcdAlpha(28), lcdAlpha(60), theme.accent.name(),
-                 ThemeManager::dropDownArrowPath(lcd)));
+                 ThemeManager::dropDownArrowPath(lcd))
+            .arg(theme.cornerRadius));
     auto* infoLayout = new QGridLayout(info);
-    infoLayout->setContentsMargins(8, 4, 8, 4);
-    infoLayout->setHorizontalSpacing(10);
+    infoLayout->setContentsMargins(6, 1, 6, 1);
+    infoLayout->setHorizontalSpacing(8);
     infoLayout->setVerticalSpacing(0);
 
-    constexpr int kValueHeight = 22;
+    constexpr int kValueHeight = 19;
     // Values are typed, scrolled or nudged with the arrow keys; spin buttons would not fit.
     const QString valueHint = "Type a value, or scroll over it to change it";
 
@@ -249,7 +278,7 @@ TransportBar::TransportBar(EditManager* editMgr, QWidget* parent)
     bpmSpin_->setDecimals(1);
     bpmSpin_->setValue(editMgr_->getBpm());
     bpmSpin_->setButtonSymbols(QAbstractSpinBox::NoButtons);
-    bpmSpin_->setFixedSize(58, kValueHeight);
+    bpmSpin_->setFixedSize(54, kValueHeight);
     connect(bpmSpin_, qOverload<double>(&QDoubleSpinBox::valueChanged),
             this, &TransportBar::onBpmChanged);
 
@@ -260,7 +289,7 @@ TransportBar::TransportBar(EditManager* editMgr, QWidget* parent)
     timeSigNumSpin_->setValue(editMgr_->getTimeSigNumerator());
     timeSigNumSpin_->setButtonSymbols(QAbstractSpinBox::NoButtons);
     timeSigNumSpin_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    timeSigNumSpin_->setFixedSize(28, kValueHeight);
+    timeSigNumSpin_->setFixedSize(26, kValueHeight);
     connect(timeSigNumSpin_, qOverload<int>(&QSpinBox::valueChanged),
             this, &TransportBar::onTimeSigNumChanged);
 
@@ -271,7 +300,7 @@ TransportBar::TransportBar(EditManager* editMgr, QWidget* parent)
     int denIdx = timeSigDenCombo_->findData(editMgr_->getTimeSigDenominator());
     if (denIdx >= 0) timeSigDenCombo_->setCurrentIndex(denIdx);
     timeSigDenCombo_->setToolTip("Beat unit");
-    timeSigDenCombo_->setFixedSize(40, kValueHeight);
+    timeSigDenCombo_->setFixedSize(38, kValueHeight);
     connect(timeSigDenCombo_, qOverload<int>(&QComboBox::currentIndexChanged),
             this, [this](int idx) {
                 if (!editMgr_ || !editMgr_->edit()) return;
@@ -299,7 +328,7 @@ TransportBar::TransportBar(EditManager* editMgr, QWidget* parent)
     snapCombo_->addItem("1/16", int(SnapMode::QuarterBeat));
     snapCombo_->addItem("1/32", int(SnapMode::EighthBeat));
     snapCombo_->setCurrentIndex(3);
-    snapCombo_->setFixedSize(58, kValueHeight);
+    snapCombo_->setFixedSize(54, kValueHeight);
     connect(snapCombo_, qOverload<int>(&QComboBox::currentIndexChanged),
             this, [this](int idx) {
                 emit snapModeRequested(snapCombo_->itemData(idx).toInt());
@@ -313,11 +342,42 @@ TransportBar::TransportBar(EditManager* editMgr, QWidget* parent)
     };
     addCaption("TEMPO", 0);
     addCaption("METER", 1);
-    addCaption("GRID", 2);
+    addCaption("SNAP", 2);
     infoLayout->addWidget(bpmSpin_, 1, 0);
     infoLayout->addLayout(meterLayout, 1, 1);
     infoLayout->addWidget(snapCombo_, 1, 2);
     layout->addWidget(info);
+    layout->addWidget(makeSeparator());
+
+    // ── Pattern picker ──
+    if (patterns_) {
+        patternSelector_ = new PatternSelector(patterns_, this);
+        layout->addWidget(patternSelector_);
+        layout->addWidget(makeSeparator());
+    }
+
+    // ── Master volume ──
+    masterKnob_ = new RotaryKnob(this);
+    masterKnob_->setAccessibleName("Master Volume");
+    masterKnob_->setRange(0.0, 1.0);
+    masterKnob_->setFixedSize(kRowHeight + 2, kRowHeight + 2);
+    syncMasterVolume();
+    connect(masterKnob_, &RotaryKnob::valueChanged, this, [this](double v) {
+        if (!editMgr_ || !editMgr_->edit()) return;
+        if (auto masterVol = editMgr_->edit()->getMasterVolumePlugin())
+            masterVol->setVolumeDb(knobToMasterDb(v));
+        const float db = knobToMasterDb(v);
+        masterKnob_->setToolTip(db <= -99.0f ? QString("Master volume: -inf dB")
+                                             : QString("Master volume: %1 dB").arg(db, 0, 'f', 1));
+    });
+    layout->addWidget(masterKnob_);
+    layout->addWidget(makeSeparator());
+
+    layout->addWidget(loopBtn_);
+    layout->addWidget(punchBtn_);
+    layout->addWidget(metronomeBtn_);
+    layout->addWidget(countInBtn_);
+    layout->addWidget(countInCombo_);
 
     layout->addStretch();
 
@@ -367,15 +427,163 @@ TransportBar::TransportBar(EditManager* editMgr, QWidget* parent)
             QSignalBlocker blocker(timeSigDenCombo_);
             timeSigDenCombo_->setCurrentIndex(denIdx);
         }
+        syncMasterVolume();
     });
+
+    // ── Pattern mode wiring ──
+    if (patterns_) {
+        connect(patterns_, &PatternManager::modeChanged, this, [this](PatternManager::Mode mode) {
+            syncModeButtons();
+            // One thing plays at a time: switching mode stops the other one.
+            if (mode == PatternManager::Mode::Song && patternPlaying())
+                player_->stop();
+            if (mode == PatternManager::Mode::Pattern && editMgr_ && editMgr_->edit()
+                && editMgr_->transport().isPlaying() && !editMgr_->transport().isRecording())
+                stopSongTransport();
+        });
+        connect(patterns_, &PatternManager::currentPatternChanged, this, [this](int id) {
+            // Follow the selection while a pattern loops.
+            if (!patternPlaying()) return;
+            if (id > 0) player_->play(id);
+            else player_->stop();
+        });
+    }
+    if (player_) {
+        connect(player_, &PatternPlayer::stepChanged, this, [this](int step) {
+            lastPatternStep_ = step;
+            if (step >= 0 && patterns_ && player_) {
+                if (auto pat = patterns_->pattern(player_->playingPattern())) {
+                    patternStepsPerBeat_ = std::max(1, pat->stepsPerBeat);
+                    playingPatternName_ = pat->name;
+                }
+            }
+        });
+        connect(player_, &PatternPlayer::playingChanged, this, [this](bool playing) {
+            if (!playing) lastPatternStep_ = -1;
+            updatePosition();
+        });
+    }
+    syncModeButtons();
 
     connect(&positionTimer_, &QTimer::timeout, this, &TransportBar::updatePosition);
     positionTimer_.start(16);
 }
 
+void TransportBar::buildModeToggle(QHBoxLayout* layout)
+{
+    auto& theme = ThemeManager::instance().current();
+    const QColor checkedText = ThemeManager::readableTextOn(theme.accent);
+    const QString style =
+        QString("QPushButton { background: %1; color: %2; border: 1px solid %3; "
+                "font-size: 10px; font-weight: bold; letter-spacing: 1px; padding: 0px; }"
+                "QPushButton:hover:!checked { background: %4; color: %5; }"
+                "QPushButton:checked { background: %6; color: %7; border-color: %8; }"
+                "QPushButton:disabled { color: %3; }")
+            .arg(theme.background.name(), theme.textDim.name(), theme.separator.name(),
+                 theme.surfaceLight.name(), theme.text.name(), theme.accent.name(),
+                 checkedText.name(), theme.accent.darker(130).name());
+    const QString r = QString::number(theme.cornerRadius);
+
+    patternModeBtn_ = new QPushButton("PAT", this);
+    patternModeBtn_->setAccessibleName("Pattern Mode");
+    patternModeBtn_->setToolTip("Pattern mode: Play loops the current pattern");
+    songModeBtn_ = new QPushButton("SONG", this);
+    songModeBtn_->setAccessibleName("Song Mode");
+    songModeBtn_->setToolTip("Song mode: Play plays the playlist");
+    for (auto* b : {patternModeBtn_, songModeBtn_}) {
+        b->setCheckable(true);
+        b->setAutoExclusive(true);
+        b->setFocusPolicy(Qt::NoFocus);
+        b->setFixedSize(b == songModeBtn_ ? 46 : 40, 28);
+    }
+    // A segmented pair: rounded only on the outside corners.
+    patternModeBtn_->setStyleSheet(style + "QPushButton { border-top-left-radius: " + r
+                                   + "px; border-bottom-left-radius: " + r + "px; }");
+    songModeBtn_->setStyleSheet(style + "QPushButton { border-top-right-radius: " + r
+                                + "px; border-bottom-right-radius: " + r + "px; "
+                                "border-left: none; }");
+
+    auto* pair = new QHBoxLayout;
+    pair->setContentsMargins(0, 0, 0, 0);
+    pair->setSpacing(0);
+    pair->addWidget(patternModeBtn_);
+    pair->addWidget(songModeBtn_);
+    layout->addLayout(pair);
+
+    connect(patternModeBtn_, &QPushButton::clicked, this, [this]() {
+        if (patterns_) patterns_->setMode(PatternManager::Mode::Pattern);
+        syncModeButtons();
+    });
+    connect(songModeBtn_, &QPushButton::clicked, this, [this]() {
+        if (patterns_) patterns_->setMode(PatternManager::Mode::Song);
+        syncModeButtons();
+    });
+}
+
+void TransportBar::syncModeButtons()
+{
+    if (!patternModeBtn_ || !songModeBtn_) return;
+    const bool havePatterns = patterns_ != nullptr && player_ != nullptr;
+    patternModeBtn_->setEnabled(havePatterns);
+    const bool pattern = havePatterns && patterns_->mode() == PatternManager::Mode::Pattern;
+    QSignalBlocker b1(patternModeBtn_), b2(songModeBtn_);
+    patternModeBtn_->setChecked(pattern);
+    songModeBtn_->setChecked(!pattern);
+}
+
+bool TransportBar::patternModeActive() const
+{
+    if (!patterns_ || !player_) return false;
+    if (patterns_->mode() != PatternManager::Mode::Pattern) return false;
+    const int id = patterns_->currentPattern();
+    return id > 0 && patterns_->pattern(id).has_value();
+}
+
+bool TransportBar::patternPlaying() const
+{
+    return player_ && player_->isPlaying();
+}
+
+void TransportBar::stopSongTransport()
+{
+    if (!editMgr_ || !editMgr_->edit()) return;
+    auto& t = editMgr_->transport();
+    t.stop(false, false);
+    if (deferredLoopActivation_) {
+        t.looping.setValue(true, nullptr);
+        deferredLoopActivation_ = false;
+    }
+}
+
+void TransportBar::togglePlay()
+{
+    if (!editMgr_ || !editMgr_->edit()) return;
+    auto& t = editMgr_->transport();
+
+    if (patternPlaying()) {
+        player_->stop();
+    } else if (t.isPlaying()) {
+        // A playing song (started by the AI, the audio clip editor or the
+        // looper) is stopped, even in Pattern mode: the toggle never starts
+        // something else. onPlay handles the deferred loop and record state.
+        onPlay();
+    } else if (patternModeActive() && !t.isRecording()) {
+        player_->play(patterns_->currentPattern());
+    } else {
+        onPlay();
+    }
+    playBtn_->setChecked(t.isPlaying() || patternPlaying());
+}
+
+void TransportBar::stopAll()
+{
+    onStop();
+}
+
 void TransportBar::onPlay()
 {
     if (!editMgr_ || !editMgr_->edit()) return;
+    if (patternPlaying()) player_->stop();
     auto& t = editMgr_->transport();
     if (t.isPlaying()) {
         t.stop(false, false);
@@ -406,6 +614,7 @@ void TransportBar::onPlay()
 
 void TransportBar::onStop()
 {
+    if (patternPlaying()) player_->stop();
     if (!editMgr_ || !editMgr_->edit()) return;
     auto& t = editMgr_->transport();
     t.stop(false, false);
@@ -422,6 +631,8 @@ void TransportBar::onStop()
 void TransportBar::onRecord()
 {
     if (!editMgr_ || !editMgr_->edit()) return;
+    // Recording runs the song transport; a looping pattern would play over it.
+    if (patternPlaying()) player_->stop();
     auto& t = editMgr_->transport();
     editMgr_->toggleRecording();
     isRecording_ = t.isRecording();
@@ -509,9 +720,15 @@ void TransportBar::syncCountInToEngine()
     }
 }
 
+void TransportBar::panic()
+{
+    onPanic();
+}
+
 void TransportBar::onPanic()
 {
     if (!editMgr_) return;
+    if (patternPlaying()) player_->stop();
     editMgr_->midiPanic();
     playBtn_->setChecked(false);
     recordBtn_->setChecked(false);
@@ -550,6 +767,7 @@ void TransportBar::onEngineToggle()
         busyDlg->exec();
         delete busyDlg;
     } else {
+        if (patternPlaying()) player_->stop();
         editMgr_->suspendEngine();
     }
 
@@ -563,14 +781,16 @@ void TransportBar::updateEngineButtonStyle()
 {
     auto& theme = ThemeManager::instance().current();
     const bool active = engineBtn_->isChecked();
-    engineBtn_->setText(active ? "ENGINE ON" : "ENGINE OFF");
+    engineBtn_->setToolTip(active ? "Audio engine on: click to turn it off"
+                                  : "Audio engine off: click to turn it on");
     engineBtn_->setStyleSheet(
         QString("QPushButton { background: %1; color: %2; border: 1px solid %3; "
-                "border-radius: 4px; font-size: 9px; font-weight: bold; letter-spacing: 1px; }"
+                "border-radius: %5px; padding: 0px; }"
                 "QPushButton:hover { background: %4; }")
             .arg(theme.background.name(),
                  (active ? theme.meterGreen : theme.textDim).name(),
-                 theme.border.name(), theme.surfaceLight.name()));
+                 theme.border.name(), theme.surfaceLight.name())
+            .arg(theme.cornerRadius));
 }
 
 void TransportBar::onBpmChanged(double bpm)
@@ -591,9 +811,31 @@ void TransportBar::onTimeSigNumChanged(int num)
     editMgr_->setTimeSignature(num, den);
 }
 
+void TransportBar::syncMasterVolume()
+{
+    if (!masterKnob_ || !editMgr_ || !editMgr_->edit()) return;
+    auto masterVol = editMgr_->edit()->getMasterVolumePlugin();
+    if (!masterVol) return;
+    const float db = masterVol->getVolumeDb();
+    const double v = masterDbToKnob(db);
+    // Showing the level must not write it back (it would round -60 dB to mute).
+    if (std::abs(masterKnob_->value() - v) > 0.002) {
+        QSignalBlocker block(masterKnob_);
+        masterKnob_->setValue(v);
+    }
+    masterKnob_->setToolTip(db <= -99.0f ? QString("Master volume: -inf dB")
+                                         : QString("Master volume: %1 dB").arg(db, 0, 'f', 1));
+}
+
 void TransportBar::updatePosition()
 {
     if (!editMgr_ || !editMgr_->edit()) return;
+
+    // The mixer's master fader (or the AI) may move the master level too.
+    if (++masterSyncTick_ >= 15) {
+        masterSyncTick_ = 0;
+        syncMasterVolume();
+    }
 
     if (editMgr_->isEngineSuspended()) {
         positionLabel_->setText("engine off");
@@ -601,7 +843,27 @@ void TransportBar::updatePosition()
         return;
     }
 
-    auto pos = editMgr_->transport().getPosition();
+    auto& transport = editMgr_->transport();
+
+    if (patternPlaying()) {
+        // The counter follows the looping pattern; the song playhead is parked.
+        const int step = std::max(0, lastPatternStep_);
+        const double beat = double(step) / double(std::max(1, patternStepsPerBeat_));
+        const int beatsPerBar = std::max(1, editMgr_->getTimeSigNumerator());
+        const int bar = int(beat / beatsPerBar) + 1;
+        const int beatInBar = int(std::fmod(beat, double(beatsPerBar))) + 1;
+        const int ticks = int(std::fmod(beat, 1.0) * 960);
+        beatLabel_->setText(QString("%1 | %2 | %3").arg(bar).arg(beatInBar)
+                                .arg(ticks, 3, 10, QChar('0')));
+        positionLabel_->setText(QString("PAT  %1").arg(playingPatternName_));
+        playBtn_->setChecked(true);
+        isRecording_ = transport.isRecording();
+        recordBtn_->setChecked(isRecording_);
+        loopBtn_->setChecked(transport.looping.get() || deferredLoopActivation_);
+        return;
+    }
+
+    auto pos = transport.getPosition();
     double secs = std::max(0.0, pos.inSeconds());
 
     int mins = int(secs) / 60;
@@ -626,21 +888,21 @@ void TransportBar::updatePosition()
             .arg(beatInBar)
             .arg(ticks, 3, 10, QChar('0')));
 
-    playBtn_->setChecked(editMgr_->transport().isPlaying());
+    playBtn_->setChecked(transport.isPlaying());
     // Recording also stops on its own (post-roll, the R key, the AI).
-    isRecording_ = editMgr_->transport().isRecording();
+    isRecording_ = transport.isRecording();
     recordBtn_->setChecked(isRecording_);
 
     // Re-enable looping once the playhead reaches the loop region
-    if (deferredLoopActivation_ && editMgr_->transport().isPlaying()) {
-        auto loopStart = editMgr_->transport().loopPoint1.get();
+    if (deferredLoopActivation_ && transport.isPlaying()) {
+        auto loopStart = transport.loopPoint1.get();
         if (pos >= loopStart) {
-            editMgr_->transport().looping.setValue(true, nullptr);
+            transport.looping.setValue(true, nullptr);
             deferredLoopActivation_ = false;
         }
     }
 
-    loopBtn_->setChecked(editMgr_->transport().looping.get() || deferredLoopActivation_);
+    loopBtn_->setChecked(transport.looping.get() || deferredLoopActivation_);
 }
 
 void TransportBar::applyButtonStyle(QPushButton* btn, const QColor& activeColor)
@@ -649,13 +911,14 @@ void TransportBar::applyButtonStyle(QPushButton* btn, const QColor& activeColor)
     const QColor checkedText = activeColor.lightnessF() > 0.6 ? QColor(20, 20, 22) : QColor(Qt::white);
     btn->setStyleSheet(
         QString("QPushButton { background: %1; color: %2; border: 1px solid %3; "
-                "border-radius: 4px; font-weight: bold; font-size: 10px; }"
+                "border-radius: %9px; font-weight: bold; font-size: 10px; padding: 0px; }"
                 "QPushButton:hover { background: %4; border-color: %5; }"
                 "QPushButton:checked { background: %6; color: %8; border-color: %7; }"
                 "QPushButton:pressed { background: %4; }")
             .arg(theme.background.name(), theme.text.name(), theme.separator.name(),
                  theme.surfaceLight.name(), theme.border.name(),
-                 activeColor.name(), activeColor.darker(130).name(), checkedText.name()));
+                 activeColor.name(), activeColor.darker(130).name(), checkedText.name())
+            .arg(theme.cornerRadius));
 }
 
 } // namespace OpenDaw

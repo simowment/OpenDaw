@@ -44,6 +44,14 @@ struct ExportSettings {
     bool useMasterPlugins = true;
     StemMode stems = StemMode::None;
     QString stemPattern = "{project} - {name}";
+    // Extra render time after the range so reverb and delay tails can decay
+    // (Renderer::Parameters::endAllowance). The render stops early once the
+    // tail goes silent. 0: the file ends exactly at the range end.
+    double tailSeconds = 0.0;
+    // True when the caller already holds the render claim (tryClaimRender()
+    // on the GUI thread before starting a worker); exportMix then neither
+    // claims nor releases it.
+    bool renderClaimed = false;
 };
 
 class EditManager : public QObject {
@@ -63,6 +71,81 @@ public:
     // For changes made outside EditManager (the looper's prints): marks the
     // project changed and refreshes the views.
     void notifyEdited() { markDirtyAndNotify(); }
+
+    // ── Signal batching ─────────────────────────────────────────────────────
+    // While a batch is open, tracksChanged / routingChanged / editChanged
+    // emitted by EditManager's own methods are deferred and sent once each
+    // (tracksChanged first) when the outermost batch ends. Only for
+    // composite operations that do not delete tracks (adding a track, its
+    // instrument and MIDI flag is one refresh instead of three). Nestable.
+    void beginSignalBatch();
+    void endSignalBatch();
+    struct ScopedSignalBatch {
+        explicit ScopedSignalBatch(EditManager& m) : m_(m) { m_.beginSignalBatch(); }
+        ~ScopedSignalBatch() { m_.endSignalBatch(); }
+        ScopedSignalBatch(const ScopedSignalBatch&) = delete;
+        ScopedSignalBatch& operator=(const ScopedSignalBatch&) = delete;
+    private:
+        EditManager& m_;
+    };
+
+    // ── Undo grouping ───────────────────────────────────────────────────────
+    // While a group is open, EditManager methods do not call
+    // UndoManager::beginNewTransaction themselves, so a caller (the agent
+    // tool executor, run_batch) gets everything in its own single
+    // transaction. Nestable.
+    void beginUndoGroup();
+    void endUndoGroup();
+    bool inUndoGroup() const { return undoGroupDepth_ > 0; }
+
+    // ── Render claim (GUI thread) ───────────────────────────────────────────
+    // Claim before starting a render on a worker thread so nothing can mutate
+    // the Edit between the claim and the worker starting. false if a render
+    // is already running.
+    bool tryClaimRender();
+    void releaseRender();
+    // RAII form: claimed() says whether the claim was taken; releases it on
+    // destruction only if it was.
+    struct ScopedRenderClaim {
+        explicit ScopedRenderClaim(EditManager& m) : m_(m), claimed_(m.tryClaimRender()) {}
+        ~ScopedRenderClaim() { if (claimed_) m_.releaseRender(); }
+        bool claimed() const { return claimed_; }
+        ScopedRenderClaim(const ScopedRenderClaim&) = delete;
+        ScopedRenderClaim& operator=(const ScopedRenderClaim&) = delete;
+    private:
+        EditManager& m_;
+        bool claimed_;
+    };
+
+    // ── Render session (message thread only) ────────────────────────────────
+    // Holds te::Edit::ScopedRenderStatus: frees the live playback context so
+    // the offline render graph is the only thing processing the Edit's
+    // plugins, and rebuilds it (plugins re-initialised at the device rate)
+    // when the outermost session ends, if it was active before. Nestable.
+    // exportMix opens one itself when it runs on the message thread. A caller
+    // that runs exportMix on a worker thread should open the session on the
+    // GUI thread before starting the worker and end it after the worker has
+    // finished, e.g.
+    //     if (!em.tryClaimRender()) -> busy
+    //     em.beginRenderSession();
+    //     settings.renderClaimed = true;
+    //     auto f = QtConcurrent::run([&] { return em.exportMix(settings, cb); });
+    //     while (!f.isFinished()) QApplication::processEvents(...);
+    //     em.endRenderSession();
+    //     em.releaseRender();
+    // (exportMix falls back to opening one through callBlocking when it runs
+    // on a worker thread without a session.)
+    void beginRenderSession();
+    void endRenderSession();
+    bool inRenderSession() const { return renderSessionDepth_.load() > 0; }
+    struct ScopedRenderSession {
+        explicit ScopedRenderSession(EditManager& m) : m_(m) { m_.beginRenderSession(); }
+        ~ScopedRenderSession() { m_.endRenderSession(); }
+        ScopedRenderSession(const ScopedRenderSession&) = delete;
+        ScopedRenderSession& operator=(const ScopedRenderSession&) = delete;
+    private:
+        EditManager& m_;
+    };
     AudioEngine&   audioEngine() { return audioEngine_; }
     te::TransportControl& transport();
 
@@ -304,6 +387,10 @@ public:
     void   setTimeSignature(int num, int den);
 
     juce::File currentFile() const { return currentFile_; }
+    // After loading an autosave for session recovery: the project is the
+    // original file again (or Untitled when it never had one), with unsaved
+    // changes, so saving never writes into the autosave folder.
+    void adoptRecoveredEdit(const juce::File& originalFile);
     bool hasUnsavedChanges() const { return hasUnsavedChanges_; }
 
     void startAutosave();
@@ -348,10 +435,21 @@ public:
     // loop start. Kept here, not in TransportBar, so a theme change's window
     // rebuild does not lose it.
     bool& loopActivationDeferred() { return loopActivationDeferred_; }
+    // Blocking. Works on a worker thread while the message thread keeps
+    // pumping, or directly on the message thread (Tracktion's callBlocking
+    // then runs inline, as for freezeTrack). progressCallback runs on the
+    // calling thread and may be null.
+    // `outcome` (optional) tells a busy refusal (another render holds the
+    // claim; lastExportError() is not touched then) from a real failure.
+    enum class ExportOutcome { Ok, Busy, Failed };
     bool exportMix(const ExportSettings& settings,
-                   std::function<void(float)> progressCallback);
+                   std::function<void(float)> progressCallback,
+                   ExportOutcome* outcome = nullptr);
     // Loudness of the last mix exportMix() wrote (not set by stem exports).
     LoudnessMeter::FileResult lastExportLoudness() const { return lastExportLoudness_; }
+    // Why the last exportMix() call returned false (empty after a success).
+    // Read it after exportMix() has returned.
+    QString lastExportError() const { return lastExportError_; }
 
     // Stems. Each stem is its sources' share of the mix: everything else is
     // muted while it renders, and buses stay on, so a stem keeps the bus
@@ -364,6 +462,12 @@ public:
     std::vector<Stem> planStems(StemMode mode) const;
     void applyStemMutes(const Stem& stem);
     void restoreStemMutes();
+    // True between applyStemMutes() and restoreStemMutes(): a stem export is
+    // using the mutes, so nobody else should change or restore them.
+    bool stemMutesActive() const { return !savedMuteSolo_.empty(); }
+    // The unmuted non-bus tracks heard through a bus, by output routing or
+    // sends, directly or through other buses. Empty for a non-bus track.
+    std::vector<te::EditItemID> busSources(te::AudioTrack* bus) const;
     QString projectName() const;
     static juce::String sanitizeForFilename(const juce::String& name);
     bool isTrackFrozen(te::AudioTrack* track) const;
@@ -416,6 +520,14 @@ private:
     void saveInputDisplayNames();
     void loadInputDisplayNames();
     void markDirtyAndNotify();
+    // Emit, or defer while a signal batch is open. Deletions (removeTrack,
+    // removeSend, undo, redo) emit directly instead, so views drop pointers
+    // to freed objects at once.
+    void emitTracksChanged();
+    void emitRoutingChanged();
+    void emitEditChanged();
+    // beginNewTransaction, skipped while an undo group is open.
+    void beginTransaction(const juce::String& name);
 
     void unfreezeAllTracks();
     void cleanupFreezeState(te::AudioTrack& track);
@@ -437,7 +549,16 @@ private:
     juce::File currentFile_;
     std::unordered_set<uint64_t> midiTrackIds_;
     std::map<std::string, QString> inputDisplayNames_;
-    std::atomic<bool> renderInProgress_ { false };   // set from the export worker thread
+    // Claimed on the GUI thread (tryClaimRender), or by exportMix itself when
+    // the caller did not claim (possibly on a worker thread).
+    std::atomic<bool> renderInProgress_ { false };
+    int signalBatchDepth_ = 0;
+    bool pendingTracksChanged_ = false;
+    bool pendingRoutingChanged_ = false;
+    bool pendingEditChanged_ = false;
+    int undoGroupDepth_ = 0;
+    std::atomic<int> renderSessionDepth_ { 0 };   // written on the message thread
+    std::unique_ptr<te::Edit::ScopedRenderStatus> renderStatus_;
     bool loopActivationDeferred_ = false;
     bool hasUnsavedChanges_ = false;
     bool engineSuspended_ = false;
@@ -451,6 +572,7 @@ private:
     };
     std::map<uint64_t, FreezeState> frozenTracks_;
     LoudnessMeter::FileResult lastExportLoudness_;
+    QString lastExportError_;
     struct SavedMuteSolo { te::EditItemID id; bool muted; bool soloed; };
     std::vector<SavedMuteSolo> savedMuteSolo_;
 };

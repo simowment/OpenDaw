@@ -2,6 +2,7 @@
 #include "utils/ThemeManager.h"
 #include <QPainter>
 #include <QMouseEvent>
+#include <QHideEvent>
 
 namespace OpenDaw {
 
@@ -189,6 +190,15 @@ void PianoKeyboard::leaveEvent(QEvent* event)
         pressedNote_ = -1;
     }
     QWidget::leaveEvent(event);
+}
+
+void PianoKeyboard::hideEvent(QHideEvent* event)
+{
+    if (pressedNote_ >= 0) {
+        emit noteReleased(pressedNote_);
+        pressedNote_ = -1;
+    }
+    QWidget::hideEvent(event);
 }
 
 } // namespace OpenDaw

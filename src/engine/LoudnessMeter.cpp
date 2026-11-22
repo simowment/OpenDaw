@@ -107,7 +107,10 @@ void LoudnessMeter::process(const float* const* channels, int numChannels, int n
 
     for (int i = 0; i < numSamples; ++i) {
         for (int c = 0; c < 2; ++c) {
-            const float x = channels[std::min(c, numChannels - 1)][i];
+            float x = channels[std::min(c, numChannels - 1)][i];
+            // One NaN or Inf would stay in the biquad state for the rest of
+            // the signal and make every later reading NaN; count it as silence.
+            if (!std::isfinite(x)) x = 0.0f;
             auto& chan = ch_[size_t(c)];
 
             const double weighted = chan.highPass.process(chan.shelf.process(x));

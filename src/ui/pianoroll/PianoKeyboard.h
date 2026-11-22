@@ -34,6 +34,7 @@ protected:
     void mouseReleaseEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void leaveEvent(QEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
 
 private:
     static bool isBlackKey(int note);

@@ -36,6 +36,10 @@ struct AiToolResult {
     QString toolUseId;
     QString content;
     bool isError = false;
+    // Machine-readable extras for external agents (MCP structuredContent).
+    // Not persisted by toJson(): chat history keeps the original format.
+    QString errorCode;        // one of AiErrorCode::* when isError, else empty
+    QJsonObject structured;   // parsed result object, or {"error":{...}} on error
 
     QJsonObject toJson() const {
         QJsonObject obj;

@@ -65,11 +65,19 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
+      # The Release folder (and so the ZIP and the installer, which take all of
+      # it) also holds the helpers OpenDawPluginScanner.exe and opendaw-mcp.exe.
       - name: Deploy Qt runtime
         shell: pwsh
         run: |
-          $exe = "build/OpenDaw_artefacts/Release/OpenDaw.exe"
-          windeployqt --release --no-translations --no-opengl-sw $exe
+          $dir = "build/OpenDaw_artefacts/Release"
+          foreach ($exe in @("$dir/OpenDaw.exe", "$dir/opendaw-mcp.exe")) {
+            windeployqt --release --no-translations --no-opengl-sw $exe
+            if ($LASTEXITCODE -ne 0) { throw "windeployqt failed for $exe" }
+          }
+          foreach ($helper in @("OpenDawPluginScanner.exe", "opendaw-mcp.exe")) {
+            if (-not (Test-Path "$dir/$helper")) { throw "$helper is missing from $dir" }
+          }
 
       - name: Bundle FFmpeg DLLs
         shell: pwsh
@@ -179,9 +187,16 @@ jobs:
             fi
           done
 
+      # opendaw-mcp (Contents/MacOS) links Qt too; without -executable its
+      # rpath would still point at this runner's Qt. OpenDawPluginScanner is
+      # JUCE only and needs no Qt.
       - name: Deploy Qt into app bundle
         run: |
-          "${{ env.QT_ROOT_DIR }}/bin/macdeployqt" "build/OpenDaw_artefacts/Release/OpenDaw.app"
+          APP="build/OpenDaw_artefacts/Release/OpenDaw.app"
+          test -f "$APP/Contents/MacOS/OpenDawPluginScanner"
+          test -f "$APP/Contents/MacOS/opendaw-mcp"
+          "${{ env.QT_ROOT_DIR }}/bin/macdeployqt" "$APP" \
+            "-executable=$APP/Contents/MacOS/opendaw-mcp"
 
       - name: Import signing certificate
         if: env.HAS_SIGNING_CERT == 'true'
@@ -225,9 +240,16 @@ jobs:
             find "$APP/Contents/PlugIns" -maxdepth 1 -type d -name "*.vst3" -print0 \
               | xargs -0 -n 1 "${SIGN[@]}"
           fi
+          # The helper executables beside the main binary. The scanner loads
+          # third-party plugins, so it needs the same entitlements as the app
+          # (disable-library-validation) or every VST3 would fail to load.
+          "${SIGN[@]}" --entitlements packaging/macos/OpenDaw.entitlements \
+            "$APP/Contents/MacOS/OpenDawPluginScanner"
+          "${SIGN[@]}" "$APP/Contents/MacOS/opendaw-mcp"
           "${SIGN[@]}" --entitlements packaging/macos/OpenDaw.entitlements "$APP"
           codesign --verify --deep --strict --verbose=2 "$APP"
           codesign --display --entitlements - "$APP"
+          codesign --display --entitlements - "$APP/Contents/MacOS/OpenDawPluginScanner"
 
       - name: Write notarization helper
         run: |
@@ -375,6 +397,10 @@ jobs:
 
           mkdir -p AppDir/usr/bin AppDir/usr/share/opendaw
           cp build/OpenDaw_artefacts/Release/OpenDaw AppDir/usr/bin/
+          # Helpers beside the main binary, where PluginScanner looks for the
+          # scanner (without it, plugins are scanned in-process).
+          cp build/OpenDaw_artefacts/Release/OpenDawPluginScanner AppDir/usr/bin/
+          cp build/OpenDaw_artefacts/Release/opendaw-mcp AppDir/usr/bin/
           cp -r build/OpenDaw_artefacts/Release/soundfonts AppDir/usr/share/opendaw/
           if [ -d build/OpenDaw_artefacts/Release/plugins ]; then
             cp -r build/OpenDaw_artefacts/Release/plugins AppDir/usr/share/opendaw/
@@ -399,6 +425,8 @@ jobs:
           ./linuxdeploy-x86_64.AppImage \
             --appdir AppDir \
             --executable AppDir/usr/bin/OpenDaw \
+            --executable AppDir/usr/bin/OpenDawPluginScanner \
+            --executable AppDir/usr/bin/opendaw-mcp \
             --desktop-file OpenDaw.desktop \
             --icon-file OpenDaw.png \
             --plugin qt \

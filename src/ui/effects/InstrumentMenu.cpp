@@ -12,6 +12,49 @@ namespace {
 QString menuText(const QString& s) { return QString(s).replace('&', "&&"); }
 }
 
+bool addBuiltInSoundMenus(QMenu& menu, const std::function<bool(int, int)>& isCurrent,
+                          const std::function<void(int, int)>& onPick, bool withHeading)
+{
+    auto& lib = SoundFontLibrary::instance();
+    if (!lib.isAvailable()) {
+        auto* missing = menu.addAction("Built-in sounds not found");
+        missing->setEnabled(false);
+        missing->setToolTip(QString("Expected GeneralUser-GS.sf2 in a soundfonts folder beside the program."));
+        return false;
+    }
+    if (withHeading) {
+        auto* heading = menu.addAction("Built-in Sounds");
+        heading->setEnabled(false);
+    }
+
+    std::map<QString, QMenu*> families;
+    for (const auto& category : SoundFontLibrary::categories())
+        families[category] = menu.addMenu(menuText(category));
+
+    QString lastCategory;
+    bool inVariations = false;
+    for (const auto& preset : lib.presets()) {
+        auto* sub = families[preset.category];
+        if (!sub) continue;
+        if (preset.category != lastCategory) { lastCategory = preset.category; inVariations = false; }
+        // General MIDI sounds first, then a separator and the variations.
+        if (!inVariations && preset.bank != 0 && !preset.isDrumKit()) {
+            sub->addSeparator();
+            inVariations = true;
+        }
+        auto* a = sub->addAction(menuText(preset.name));
+        const int bank = preset.bank, program = preset.program;
+        if (isCurrent) {
+            a->setCheckable(true);
+            a->setChecked(isCurrent(bank, program));
+        }
+        QObject::connect(a, &QAction::triggered, &menu, [onPick, bank, program]() {
+            if (onPick) onPick(bank, program);
+        });
+    }
+    return true;
+}
+
 void showInstrumentMenu(EditManager& editMgr, te::AudioTrack* track,
                         const std::function<void()>& chooseVst,
                         const std::function<void()>& chooseSurge, const QPoint& globalPos)
@@ -24,35 +67,15 @@ void showInstrumentMenu(EditManager& editMgr, te::AudioTrack* track,
     menu.setAccessibleName("Instrument Menu");
     menu.setToolTipsVisible(true);
 
-    auto& lib = SoundFontLibrary::instance();
-    if (lib.isAvailable()) {
-        auto* heading = menu.addAction("Built-in Sounds");
-        heading->setEnabled(false);
-
-        std::map<QString, QMenu*> families;
-        for (const auto& category : SoundFontLibrary::categories())
-            families[category] = menu.addMenu(menuText(category));
-
-        QString lastCategory;
-        bool inVariations = false;
-        for (const auto& preset : lib.presets()) {
-            auto* sub = families[preset.category];
-            if (!sub) continue;
-            if (preset.category != lastCategory) { lastCategory = preset.category; inVariations = false; }
-            // General MIDI sounds first, then a separator and the variations.
-            if (!inVariations && preset.bank != 0 && !preset.isDrumKit()) {
-                sub->addSeparator();
-                inVariations = true;
-            }
-            auto* a = sub->addAction(menuText(preset.name));
-            a->setCheckable(true);
-            a->setChecked(builtIn && builtIn->bank() == preset.bank && builtIn->program() == preset.program);
-            const int bank = preset.bank, program = preset.program;
-            QObject::connect(a, &QAction::triggered, &menu, [&editMgr, track, bank, program]() {
-                editMgr.setTrackBuiltInInstrument(*track, bank, program);
-            });
-        }
-
+    const bool haveBuiltIn = addBuiltInSoundMenus(
+        menu,
+        [builtIn](int bank, int program) {
+            return builtIn && builtIn->bank() == bank && builtIn->program() == program;
+        },
+        [&editMgr, track](int bank, int program) {
+            editMgr.setTrackBuiltInInstrument(*track, bank, program);
+        });
+    if (haveBuiltIn) {
         if (builtIn) {
             menu.addSeparator();
             auto* gm = menu.addAction("Follow MIDI Program Changes");
@@ -67,10 +90,6 @@ void showInstrumentMenu(EditManager& editMgr, te::AudioTrack* track,
                 editMgr.notifyEdited();
             });
         }
-    } else {
-        auto* missing = menu.addAction("Built-in sounds not found");
-        missing->setEnabled(false);
-        missing->setToolTip(QString("Expected GeneralUser-GS.sf2 in a soundfonts folder beside the program."));
     }
 
     if (chooseSurge) {

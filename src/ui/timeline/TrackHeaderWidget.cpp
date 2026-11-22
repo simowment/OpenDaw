@@ -11,9 +11,18 @@
 #include <QApplication>
 #include <QToolTip>
 #include <QPainter>
+#include <QPointer>
+#include <algorithm>
 #include <cmath>
 
 namespace {
+// Restyling is expensive (Qt re-polishes the widget): skip it when unchanged.
+void setStyleSheetIfChanged(QWidget* w, const QString& css)
+{
+    if (w && w->styleSheet() != css)
+        w->setStyleSheet(css);
+}
+
 float dbToNormalized(float db) {
     constexpr float minDb = -60.0f;
     constexpr float maxDb = 6.0f;
@@ -26,9 +35,19 @@ float dbToNormalized(float db) {
 namespace OpenDaw {
 
 TrackHeaderWidget::TrackHeaderWidget(te::AudioTrack* track, EditManager* editMgr,
-                                     QWidget* parent)
-    : QWidget(parent), track_(track), editMgr_(editMgr)
+                                     QWidget* parent, const TrackRoutingChoices* routing)
+    : QWidget(parent), track_(track),
+      trackId_(track ? track->itemID.getRawID() : 0),
+      kind_(track && editMgr ? trackWidgetKind(*editMgr, track) : TrackWidgetKind::Audio),
+      editMgr_(editMgr)
 {
+    trackRef_ = track;
+    // A header built on its own (not by TimelineView) queries the devices itself.
+    std::optional<TrackRoutingChoices> ownRouting;
+    if (!routing && track_ && editMgr_) {
+        ownRouting = TrackRoutingChoices::query(*editMgr_);
+        routing = &*ownRouting;
+    }
     setAccessibleName("Track Header");
     setObjectName("trackHeaderWidget");
     auto& theme = ThemeManager::instance().current();
@@ -105,8 +124,8 @@ TrackHeaderWidget::TrackHeaderWidget(te::AudioTrack* track, EditManager* editMgr
     nameLabel_->installEventFilter(this);
     nameLayout->addWidget(nameLabel_, 1);
 
-    const bool isMidi = editMgr_->isMidiTrack(track_);
-    const bool isBus = editMgr_->isBusTrack(track_);
+    const bool isMidi = kind_ == TrackWidgetKind::Midi;
+    const bool isBus = kind_ == TrackWidgetKind::Bus;
     typeLabel_ = new QLabel(isMidi ? "MIDI" : (isBus ? "BUS" : "AUDIO"), nameRow);
     typeLabel_->setAccessibleName("Track Type");
     typeLabel_->setAlignment(Qt::AlignCenter);
@@ -139,12 +158,12 @@ TrackHeaderWidget::TrackHeaderWidget(te::AudioTrack* track, EditManager* editMgr
 
     soloBtn_ = makeToggle("S", "Solo", "Solo", theme.soloButton);
     connect(soloBtn_, &QPushButton::toggled, this, [this](bool s) {
-        if (track_) track_->setSolo(s);
+        if (trackAlive()) track_->setSolo(s);
     });
 
     muteBtn_ = makeToggle("M", "Mute", "Mute", theme.muteButton);
     connect(muteBtn_, &QPushButton::toggled, this, [this](bool m) {
-        if (track_) track_->setMute(m);
+        if (trackAlive()) track_->setMute(m);
     });
 
     buttonLayout->addSpacing(6);
@@ -152,10 +171,10 @@ TrackHeaderWidget::TrackHeaderWidget(te::AudioTrack* track, EditManager* editMgr
     const QFont audioIconFont = icons::fontAudio(12);
     monoBtn_ = makeToggle(QString(), "Mono Or Stereo", QString(), theme.accent, &audioIconFont);
     connect(monoBtn_, &QPushButton::toggled, this, [this](bool mono) {
-        if (!track_ || !editMgr_) return;
+        if (!trackAlive() || !editMgr_) return;
         updateMonoButtonVisual(mono);
-        // setTrackMono emits tracksChanged, which deletes and rebuilds this
-        // header, so nothing may touch `this` after it.
+        // setTrackMono emits tracksChanged; the header normally survives it,
+        // but nothing may touch `this` after it in case it was retired.
         editMgr_->setTrackMono(*track_, mono);
     });
 
@@ -165,7 +184,7 @@ TrackHeaderWidget::TrackHeaderWidget(te::AudioTrack* track, EditManager* editMgr
                             &materialFont);
     freezeBtn_->setCheckable(false);
     connect(freezeBtn_, &QPushButton::clicked, this, [this]() {
-        if (!track_ || !editMgr_) return;
+        if (!trackAlive() || !editMgr_) return;
         if (editMgr_->isRenderInProgress()) return;
         QApplication::setOverrideCursor(Qt::WaitCursor);
         bool frozen = editMgr_->isTrackFrozen(track_);
@@ -184,16 +203,10 @@ TrackHeaderWidget::TrackHeaderWidget(te::AudioTrack* track, EditManager* editMgr
     });
 
     // Take lanes: only audio tracks record takes.
-    if (editMgr_ && !editMgr_->isMidiTrack(track_) && !editMgr_->isBusTrack(track_)) {
-        const int takeCount = int(editMgr_->getTakes(track_).size());
+    if (editMgr_ && kind_ == TrackWidgetKind::Audio) {
         takesBtn_ = makeToggle(QString(icons::mi::Layers), "Toggle Take Lanes",
-                               takeCount > 0
-                                   ? QString("Show this track's %1 take%2 to comp them")
-                                         .arg(takeCount).arg(takeCount == 1 ? "" : "s")
-                                   : QString("Take lanes: each recording pass becomes a take "
-                                             "you can comp from. None yet."),
-                               theme.accent, &materialFont);
-        takesBtn_->setEnabled(takeCount > 0);
+                               QString(), theme.accent, &materialFont);
+        updateTakesButton();
         connect(takesBtn_, &QPushButton::toggled, this, [this](bool checked) {
             emit takesToggled(track_, checked);
         });
@@ -208,14 +221,8 @@ TrackHeaderWidget::TrackHeaderWidget(te::AudioTrack* track, EditManager* editMgr
     }
     updateMonoButtonVisual(mono);
 
-    connect(editMgr_, &EditManager::tracksChanged, this, [this]() {
-        if (!track_ || !monoBtn_ || !editMgr_)
-            return;
-        const bool isMono = editMgr_->isTrackMono(track_);
-        QSignalBlocker block(monoBtn_);
-        monoBtn_->setChecked(isMono);
-        updateMonoButtonVisual(isMono);
-    });
+    // Mono, like the rest of the header, is re-read by refresh(): TimelineView
+    // calls it for every surviving header on tracksChanged.
 
     connect(editMgr_, &EditManager::trackFreezeStateChanged, this, [this](te::AudioTrack* t) {
         if (t != track_ || !freezeBtn_ || !editMgr_) return;
@@ -225,11 +232,8 @@ TrackHeaderWidget::TrackHeaderWidget(te::AudioTrack* track, EditManager* editMgr
     // ── Optional rows, shown as the track gets taller (in this order) ──
     if (isMidi) {
         auto [instrumentRow, instrumentLayout] = makeRow(kDetailRowHeight);
-        auto* instrument = editMgr_->getTrackInstrument(track_);
-        QString instrName = instrument
-            ? QString::fromStdString(instrument->getName().toStdString())
-            : "No Instrument";
-        instrumentBtn_ = new QPushButton(instrName, instrumentRow);
+        instrumentBtn_ = new QPushButton(instrumentRow);
+        updateInstrumentButton();
         instrumentBtn_->setAccessibleName("Instrument");
         instrumentBtn_->setToolTip("Click to open the instrument, right-click to change it");
         instrumentBtn_->setFixedHeight(kDetailRowHeight);
@@ -242,11 +246,12 @@ TrackHeaderWidget::TrackHeaderWidget(te::AudioTrack* track, EditManager* editMgr
                      theme.surfaceLight.name(), theme.accent.name()));
 
         connect(instrumentBtn_, &QPushButton::clicked, this, [this]() {
+            if (!trackAlive()) return;
             auto* instr = editMgr_->getTrackInstrument(track_);
             if (auto* ext = dynamic_cast<te::ExternalPlugin*>(instr)) {
                 PluginEditorWindow::showForPlugin(*ext);
             } else {
-                emit instrumentSelectRequested(track_);
+                if (trackAlive()) emit instrumentSelectRequested(track_);
             }
         });
 
@@ -254,13 +259,17 @@ TrackHeaderWidget::TrackHeaderWidget(te::AudioTrack* track, EditManager* editMgr
                 this, [this](const QPoint& pos) {
                     QMenu menu;
                     menu.setAccessibleName("Instrument Menu");
+                    if (!trackAlive()) return;
                     menu.addAction("Change Instrument...", [this]() {
-                        emit instrumentSelectRequested(track_);
+                        if (trackAlive()) emit instrumentSelectRequested(track_);
                     });
                     auto* instr = editMgr_->getTrackInstrument(track_);
                     if (auto* ext = dynamic_cast<te::ExternalPlugin*>(instr)) {
-                        menu.addAction("Open VST Editor", [ext]() {
-                            PluginEditorWindow::showForPlugin(*ext);
+                        // Weak: the plugin may go while the menu is open.
+                        const juce::WeakReference<te::Selectable> extRef(ext);
+                        menu.addAction("Open VST Editor", [extRef]() {
+                            if (auto* p = dynamic_cast<te::ExternalPlugin*>(extRef.get()))
+                                PluginEditorWindow::showForPlugin(*p);
                         });
                     }
                     menu.exec(instrumentBtn_->mapToGlobal(pos));
@@ -289,7 +298,7 @@ TrackHeaderWidget::TrackHeaderWidget(te::AudioTrack* track, EditManager* editMgr
     volumeSlider_->setValue(91);
     volumeSlider_->setStyleSheet(QString(sliderStyle).replace("%SUBPAGE%", theme.accent.name()));
     connect(volumeSlider_, &QSlider::valueChanged, this, [this](int v) {
-        if (!track_) return;
+        if (!trackAlive()) return;
         for (auto* plugin : track_->pluginList.getPlugins()) {
             if (auto* volPan = dynamic_cast<te::VolumeAndPanPlugin*>(plugin)) {
                 double norm = v / 100.0;
@@ -314,7 +323,7 @@ TrackHeaderWidget::TrackHeaderWidget(te::AudioTrack* track, EditManager* editMgr
     panKnob_->setStyleSheet(QString(sliderStyle).replace("%SUBPAGE%", theme.controlTrack.name()));
     panKnob_->installEventFilter(this);
     connect(panKnob_, &QSlider::valueChanged, this, [this](int v) {
-        if (!track_) return;
+        if (!trackAlive()) return;
         panKnob_->setToolTip(v == 0 ? QString("Pan: centre")
                                     : QString("Pan: %1 %2").arg(std::abs(v)).arg(v < 0 ? "L" : "R"));
         for (auto* plugin : track_->pluginList.getPlugins()) {
@@ -336,7 +345,7 @@ TrackHeaderWidget::TrackHeaderWidget(te::AudioTrack* track, EditManager* editMgr
     inputCombo_->setMinimumWidth(10);
     inputCombo_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
     inputCombo_->setStyleSheet(smallComboStyle);
-    populateInputCombo();
+    populateInputCombo(routing);
     connect(inputCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &TrackHeaderWidget::onInputComboChanged);
     ioLayout->addWidget(inputCombo_, 1);
@@ -348,7 +357,7 @@ TrackHeaderWidget::TrackHeaderWidget(te::AudioTrack* track, EditManager* editMgr
     outputCombo_->setMinimumWidth(10);
     outputCombo_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
     outputCombo_->setStyleSheet(smallComboStyle);
-    populateOutputCombo();
+    populateOutputCombo(routing);
     connect(outputCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &TrackHeaderWidget::onOutputComboChanged);
     ioLayout->addWidget(outputCombo_, 1);
@@ -370,8 +379,10 @@ TrackHeaderWidget::TrackHeaderWidget(te::AudioTrack* track, EditManager* editMgr
     updateRowVisibility();
 
     levelMeterPlugin_ = track_->getLevelMeterPlugin();
-    if (levelMeterPlugin_)
+    if (levelMeterPlugin_) {
+        levelMeterRef_ = levelMeterPlugin_;
         levelMeterPlugin_->measurer.addClient(meterClient_);
+    }
 
     connect(&meterTimer_, &QTimer::timeout, this, &TrackHeaderWidget::updateMeter);
     meterTimer_.start(30);
@@ -380,15 +391,35 @@ TrackHeaderWidget::TrackHeaderWidget(te::AudioTrack* track, EditManager* editMgr
 TrackHeaderWidget::~TrackHeaderWidget()
 {
     meterTimer_.stop();
-    if (levelMeterPlugin_)
-        levelMeterPlugin_->measurer.removeClient(meterClient_);
+    dropLevelMeterClient();
 }
 
-void TrackHeaderWidget::refresh()
+void TrackHeaderWidget::dropLevelMeterClient()
 {
-    if (!track_) return;
-    nameLabel_->setText(QString::fromStdString(track_->getName().toStdString()));
-    nameLabel_->setToolTip(nameLabel_->text() + "\nDouble-click to rename");
+    // The plugin may already be gone with its track: only a live one still
+    // holds our client.
+    if (levelMeterPlugin_ && levelMeterRef_.get() != nullptr)
+        levelMeterPlugin_->measurer.removeClient(meterClient_);
+    levelMeterPlugin_ = nullptr;
+    levelMeterRef_ = nullptr;
+}
+
+void TrackHeaderWidget::detach()
+{
+    meterTimer_.stop();
+    dropLevelMeterClient();
+    track_ = nullptr;
+    trackRef_ = nullptr;
+}
+
+void TrackHeaderWidget::refresh(const TrackRoutingChoices* routing, std::optional<bool> anySoloed)
+{
+    if (!trackAlive()) return;
+    const QString name = QString::fromStdString(track_->getName().toStdString());
+    if (nameLabel_->text() != name) {
+        nameLabel_->setText(name);
+        nameLabel_->setToolTip(name + "\nDouble-click to rename");
+    }
 
     const QColor colour = editMgr_ ? editMgr_->getTrackColour(track_) : trackColour_;
     if (colour != trackColour_) {
@@ -406,8 +437,10 @@ void TrackHeaderWidget::refresh()
     }
 
     bool soloOverridesMute = track_->isSolo(false) && track_->isMuted(false);
-    muteBtn_->setEnabled(!soloOverridesMute);
-    muteBtn_->setToolTip(soloOverridesMute ? "Mute overridden by Solo" : "Mute");
+    if (muteBtn_->isEnabled() == soloOverridesMute) {
+        muteBtn_->setEnabled(!soloOverridesMute);
+        muteBtn_->setToolTip(soloOverridesMute ? "Mute overridden by Solo" : "Mute");
+    }
 
     if (editMgr_ && armBtn_) {
         QSignalBlocker block(armBtn_);
@@ -436,28 +469,77 @@ void TrackHeaderWidget::refresh()
         }
     }
 
-    refreshNameStyle();
+    // What a rebuild used to pick up by recreating the header.
+    populateInputCombo(routing);
+    populateOutputCombo(routing);
+    updateInstrumentButton();
+    updateTakesButton();
+    if (editMgr_)
+        updateFreezeButtonVisual(editMgr_->isTrackFrozen(track_));   // restyles only on change
+    // The plugin list may have changed (or the track been replaced by an
+    // undo): follow its current meter.
+    if (track_->getLevelMeterPlugin() != levelMeterPlugin_ || levelMeterRef_.get() == nullptr) {
+        dropLevelMeterClient();
+        levelMeterPlugin_ = track_->getLevelMeterPlugin();
+        if (levelMeterPlugin_) {
+            levelMeterRef_ = levelMeterPlugin_;
+            levelMeterPlugin_->measurer.addClient(meterClient_);
+        }
+    }
+
+    refreshNameStyle(anySoloed);
 }
 
-void TrackHeaderWidget::refreshNameStyle()
+void TrackHeaderWidget::updateInstrumentButton()
+{
+    if (!instrumentBtn_ || !trackAlive() || !editMgr_) return;
+    auto* instrument = editMgr_->getTrackInstrument(track_);
+    const QString instrName = instrument
+        ? QString::fromStdString(instrument->getName().toStdString())
+        : "No Instrument";
+    if (instrumentBtn_->text() != instrName)
+        instrumentBtn_->setText(instrName);
+}
+
+void TrackHeaderWidget::updateTakesButton()
+{
+    if (!takesBtn_ || !trackAlive() || !editMgr_) return;
+    const int takeCount = int(editMgr_->getTakes(track_).size());
+    const QString tip = takeCount > 0
+        ? QString("Show this track's %1 take%2 to comp them")
+              .arg(takeCount).arg(takeCount == 1 ? "" : "s")
+        : QString("Take lanes: each recording pass becomes a take "
+                  "you can comp from. None yet.");
+    if (takesBtn_->toolTip() != tip)
+        takesBtn_->setToolTip(tip);
+    if (takesBtn_->isEnabled() != (takeCount > 0))
+        takesBtn_->setEnabled(takeCount > 0);
+}
+
+void TrackHeaderWidget::refreshNameStyle(std::optional<bool> anySoloed)
 {
     auto& theme = ThemeManager::instance().current();
+    const bool alive = trackAlive();
 
     // Dim tracks that are silenced by another track's solo.
     bool silencedBySolo = false;
-    if (editMgr_ && editMgr_->edit() && track_ && !track_->isSolo(false)) {
-        for (auto* t : te::getAudioTracks(*editMgr_->edit()))
-            if (t->isSolo(false)) { silencedBySolo = true; break; }
+    if (alive && !track_->isSolo(false)) {
+        if (anySoloed) {
+            silencedBySolo = *anySoloed;
+        } else if (editMgr_ && editMgr_->edit()) {
+            for (auto* t : te::getAudioTracks(*editMgr_->edit()))
+                if (t->isSolo(false)) { silencedBySolo = true; break; }
+        }
     }
-    const bool frozen = editMgr_ && track_ && editMgr_->isTrackFrozen(track_);
+    const bool frozen = editMgr_ && alive && editMgr_->isTrackFrozen(track_);
 
     QColor colour = theme.text;
     if (frozen)
         colour = QColor(120, 190, 230);
-    else if (silencedBySolo || (track_ && track_->isMuted(false)))
+    else if (silencedBySolo || (alive && track_->isMuted(false)))
         colour = theme.textDim;
 
-    nameLabel_->setStyleSheet(
+    setStyleSheetIfChanged(nameLabel_,
         QString("QLabel { color: %1; font-size: 11px; font-weight: bold; background: transparent; }")
             .arg(colour.name()));
 }
@@ -493,6 +575,7 @@ void TrackHeaderWidget::setCollapsed(bool collapsed)
 
 void TrackHeaderWidget::setIndented(bool indented)
 {
+    if (indented_ == indented) return;
     indented_ = indented;
     if (auto* l = layout())
         l->setContentsMargins(kLeftMargin + (indented ? 10 : 0), kVMargin, 4, kVMargin);
@@ -507,14 +590,16 @@ void TrackHeaderWidget::setTrackHeight(int h)
 
 void TrackHeaderWidget::updateRowVisibility()
 {
+    // Compact rows (vertical zoom out) show only the name row; the buttons
+    // come back as soon as they fit, then the optional rows in order.
+    int available = height() - 2 * kVMargin - kNameRowHeight;
+    const bool buttonsFit = !collapsed_ && available >= kRowSpacing + kButtonRowHeight;
     if (buttonRow_)
-        buttonRow_->setVisible(!collapsed_);
-
-    // Reveal the optional rows in order while they fit.
-    int available = height() - 2 * kVMargin - kNameRowHeight
-                    - (collapsed_ ? 0 : kRowSpacing + kButtonRowHeight);
+        buttonRow_->setVisible(buttonsFit);
+    if (buttonsFit)
+        available -= kRowSpacing + kButtonRowHeight;
     for (auto* row : optionalRows_) {
-        const bool fits = !collapsed_ && available >= kRowSpacing + kDetailRowHeight;
+        const bool fits = buttonsFit && available >= kRowSpacing + kDetailRowHeight;
         row->setVisible(fits);
         if (fits)
             available -= kRowSpacing + kDetailRowHeight;
@@ -529,10 +614,8 @@ void TrackHeaderWidget::resizeEvent(QResizeEvent* event)
 
 QSize TrackHeaderWidget::minimumSizeHint() const
 {
-    int h = 2 * kVMargin + kNameRowHeight;
-    if (!collapsed_)
-        h += kRowSpacing + kButtonRowHeight;
-    return QSize(metrics::kTrackHeaderWidth, h);
+    // Just the name row: tracks can be zoomed down to a compact strip.
+    return QSize(metrics::kTrackHeaderWidth, 2 * kVMargin + kNameRowHeight);
 }
 
 void TrackHeaderWidget::setSelected(bool sel)
@@ -552,16 +635,24 @@ void TrackHeaderWidget::paintEvent(QPaintEvent*)
     auto& theme = ThemeManager::instance().current();
     QPainter p(this);
 
-    const bool frozen = editMgr_ && track_ && editMgr_->isTrackFrozen(track_);
+    const bool frozen = editMgr_ && trackAlive() && editMgr_->isTrackFrozen(track_);
     QColor bg = selected_ ? theme.surfaceLight : theme.surface;
+    // A faint wash of the track colour, so headers read as coloured channels.
+    if (trackColour_.isValid()) {
+        const double t = 0.07;
+        bg = QColor(int(trackColour_.red() * t + bg.red() * (1.0 - t)),
+                    int(trackColour_.green() * t + bg.green() * (1.0 - t)),
+                    int(trackColour_.blue() * t + bg.blue() * (1.0 - t)));
+    }
     if (frozen)
-        bg = QColor(bg.red() - 4, bg.green() + 2, bg.blue() + 8);
+        bg = QColor(std::clamp(bg.red() - 4, 0, 255), std::clamp(bg.green() + 2, 0, 255),
+                    std::clamp(bg.blue() + 8, 0, 255));
     p.fillRect(rect(), bg);
 
     // Colour strip (indented tracks sit inside a folder, so shift it in).
     const int stripX = indented_ ? 10 : 0;
     QColor strip = trackColour_;
-    if (track_ && track_->isMuted(false))
+    if (trackAlive() && track_->isMuted(false))
         strip = strip.darker(170);
     p.fillRect(QRect(stripX, 0, metrics::kTrackColourStrip, height()), strip);
 
@@ -582,7 +673,7 @@ void TrackHeaderWidget::mousePressEvent(QMouseEvent* event)
 
 void TrackHeaderWidget::contextMenuEvent(QContextMenuEvent* event)
 {
-    if (!track_ || !editMgr_) return;
+    if (!trackAlive() || !editMgr_) return;
 
     QMenu menu(this);
     menu.setAccessibleName("Track Context Menu");
@@ -607,7 +698,7 @@ void TrackHeaderWidget::contextMenuEvent(QContextMenuEvent* event)
     menu.addSeparator();
 
     auto* split = menu.addAction("Split Piano Hands (AI)...", this, [this]() {
-        emit splitHandsRequested(track_);
+        if (trackAlive()) emit splitHandsRequested(track_);
     });
     split->setToolTip("Use AI to split a piano recording into right-hand and left-hand tracks");
     split->setEnabled(editMgr_->isMidiTrack(track_) && !editMgr_->isTrackFrozen(track_));
@@ -631,7 +722,7 @@ bool TrackHeaderWidget::eventFilter(QObject* obj, QEvent* event)
         return true;
     }
 
-    if (obj == nameLabel_ && event->type() == QEvent::MouseButtonDblClick && track_) {
+    if (obj == nameLabel_ && event->type() == QEvent::MouseButtonDblClick && trackAlive()) {
         startRenameEdit();
         return true;
     }
@@ -695,7 +786,7 @@ bool TrackHeaderWidget::eventFilter(QObject* obj, QEvent* event)
 
 void TrackHeaderWidget::startRenameEdit()
 {
-    if (!track_ || !editMgr_) return;
+    if (!trackAlive() || !editMgr_) return;
 
     auto* edit = new QLineEdit(this);
     edit->setAccessibleName("Rename Track");
@@ -712,28 +803,39 @@ void TrackHeaderWidget::startRenameEdit()
     edit->setFocus();
     nameLabel_->hide();
 
-    auto* track = track_;
+    // By id, not pointer: the track may be deleted before the timer fires.
+    const auto trackId = track_->itemID;
     auto* mgr = editMgr_;
-    auto* nameLbl = nameLabel_;
+    QPointer<QLabel> nameLbl = nameLabel_;
 
-    connect(edit, &QLineEdit::editingFinished, edit, [edit, track, mgr, nameLbl]() {
+    connect(edit, &QLineEdit::editingFinished, edit, [edit, trackId, mgr, nameLbl]() {
         QString newName = edit->text().trimmed();
         edit->hide();
         edit->deleteLater();
-        if (!newName.isEmpty() && track) {
-            QTimer::singleShot(0, mgr, [track, mgr, newName]() {
-                track->setName(juce::String(newName.toStdString()));
-                emit mgr->tracksChanged();
-            });
-        } else if (nameLbl) {
+        // The header survives the rename now (it is no longer rebuilt), so
+        // bring its label back here.
+        if (nameLbl) {
+            if (!newName.isEmpty())
+                nameLbl->setText(newName);
             nameLbl->show();
+        }
+        if (!newName.isEmpty() && mgr) {
+            QTimer::singleShot(0, mgr, [trackId, mgr, newName]() {
+                for (auto* t : mgr->getAudioTracks()) {
+                    if (t->itemID == trackId) {
+                        t->setName(juce::String(newName.toStdString()));
+                        emit mgr->tracksChanged();
+                        return;
+                    }
+                }
+            });
         }
     });
 }
 
 void TrackHeaderWidget::updateMeter()
 {
-    if (!track_ || !editMgr_ || !editMgr_->edit())
+    if (!trackAlive() || !editMgr_ || !editMgr_->edit())
         return;
 
     if (levelMeterPlugin_) {
@@ -797,6 +899,8 @@ void TrackHeaderWidget::updateMonoButtonVisual(bool mono)
 void TrackHeaderWidget::updateFreezeButtonVisual(bool frozen)
 {
     if (!freezeBtn_) return;
+    if (frozenShown_ == int(frozen)) return;
+    frozenShown_ = int(frozen);
 
     const QColor freezeColor(70, 170, 220);
     if (frozen) {
@@ -814,43 +918,28 @@ void TrackHeaderWidget::updateFreezeButtonVisual(bool frozen)
     update();
 }
 
-void TrackHeaderWidget::populateInputCombo()
+void TrackHeaderWidget::populateInputCombo(const TrackRoutingChoices* routing)
 {
-    if (!inputCombo_ || !editMgr_) return;
+    if (!inputCombo_ || !editMgr_ || !trackAlive()) return;
 
-    QSignalBlocker block(inputCombo_);
-    inputCombo_->clear();
-    inputCombo_->addItem("No Input", QString());
+    if (routing)
+        setComboItemsIfChanged(inputCombo_,
+                               routing->inputItemsFor(kind_ == TrackWidgetKind::Midi));
 
-    bool isMidi = track_ && editMgr_->isMidiTrack(track_);
-
-    if (isMidi) {
-        auto midiSources = editMgr_->getAvailableMidiInputSources();
-        for (const auto& src : midiSources)
-            inputCombo_->addItem(src.displayName,
-                                 QString("midi:") + QString::fromStdString(
-                                     src.deviceName.toStdString()));
-    }
-
-    auto sources = editMgr_->getAvailableInputSources();
-    for (const auto& src : sources)
-        inputCombo_->addItem(src.displayName,
-                             QString::fromStdString(src.deviceName.toStdString()));
-
-    QString currentInput = track_ ? editMgr_->getTrackInputName(track_) : QString();
+    const QString currentInput = editMgr_->getTrackInputName(track_);
     if (currentInput.isEmpty()) {
-        inputCombo_->setCurrentIndex(0);
+        if (inputCombo_->currentIndex() != 0) {
+            QSignalBlocker block(inputCombo_);
+            inputCombo_->setCurrentIndex(0);
+        }
     } else {
-        int idx = inputCombo_->findData(currentInput);
-        if (idx < 0)
-            idx = inputCombo_->findData("midi:" + currentInput);
-        inputCombo_->setCurrentIndex(idx >= 0 ? idx : 0);
+        selectComboData(inputCombo_, currentInput, "midi:" + currentInput);
     }
 }
 
 void TrackHeaderWidget::onInputComboChanged(int index)
 {
-    if (!track_ || !editMgr_ || index < 0) return;
+    if (!trackAlive() || !editMgr_ || index < 0) return;
 
     QString deviceName = inputCombo_->itemData(index).toString();
     if (deviceName.isEmpty()) {
@@ -868,29 +957,25 @@ void TrackHeaderWidget::onInputComboChanged(int index)
     }
 }
 
-void TrackHeaderWidget::populateOutputCombo()
+void TrackHeaderWidget::populateOutputCombo(const TrackRoutingChoices* routing)
 {
-    if (!outputCombo_ || !editMgr_) return;
+    if (!outputCombo_ || !editMgr_ || !trackAlive()) return;
 
-    QSignalBlocker block(outputCombo_);
-    outputCombo_->clear();
-    for (const auto& choice : editMgr_->getOutputChoices(track_))
-        outputCombo_->addItem(choice.label, choice.key);
-
-    if (!track_) return;
-    int idx = outputCombo_->findData(editMgr_->currentOutputKey(track_));
-    outputCombo_->setCurrentIndex(idx >= 0 ? idx : 0);
+    if (routing)
+        setComboItemsIfChanged(outputCombo_,
+                               toComboItems(routing->outputChoicesFor(*editMgr_, track_)));
+    selectComboData(outputCombo_, editMgr_->currentOutputKey(track_));
 }
 
 void TrackHeaderWidget::onOutputComboChanged(int index)
 {
-    if (!track_ || !editMgr_ || index < 0) return;
+    if (!trackAlive() || !editMgr_ || index < 0) return;
     editMgr_->setTrackOutputByKey(*track_, outputCombo_->itemData(index).toString());
 }
 
 void TrackHeaderWidget::onArmToggled(bool armed)
 {
-    if (!track_ || !editMgr_) return;
+    if (!trackAlive() || !editMgr_) return;
 
     QString currentInput = editMgr_->getTrackInputName(track_);
     if (armed && currentInput.isEmpty()) {

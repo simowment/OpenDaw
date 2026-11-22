@@ -26,13 +26,17 @@ $env:PATH = "c:\qt\6.10.2\msvc2022_64\bin;" + $env:PATH
 .\build\OpenDaw_artefacts\Debug\OpenDaw.exe
 ```
 
-First build takes 2-4 minutes (compiling JUCE/Tracktion). Incremental rebuilds take ~10-15 seconds. There is no test suite.
+Or simply `.\build.ps1` (finds Visual Studio/Build Tools via vswhere, Qt in `C:\Qt\6.10.2\msvc2022_64` or `$env:QT_DIR`, vcpkg in `C:\vcpkg` or `$env:VCPKG_ROOT`); `.\build.ps1 -Test` also runs the tests.
+
+First build takes 2-4 minutes (compiling JUCE/Tracktion). Incremental rebuilds take ~10-15 seconds.
+
+**Tests:** `ctest --test-dir build --output-on-failure` (or `build\OpenDawTests.exe --class TestPatterns -o -,txt`). Qt Test based integration suite in `tests/`, linked against the `OpenDawCore` library; runs headless (`QT_QPA_PLATFORM=offscreen`) with no audio device. See `tests/README.md`.
 
 ## Architecture
 
 ### Framework Bridge
 
-Two frameworks coexist via `JuceQtBridge` (`src/app/JuceQtBridge.h`): a `QTimer` fires every 10ms to pump JUCE's `MessageManager` from inside Qt's event loop. JUCE's audio processing runs on its own real-time thread, independent of both GUI event loops. This pump must be running before any Tracktion Engine calls.
+Two frameworks coexist via `JuceQtBridge` (`src/app/JuceQtBridge.h`): a `QTimer` fires every 5ms to pump JUCE's `MessageManager` from inside Qt's event loop. JUCE's audio processing runs on its own real-time thread, independent of both GUI event loops. This pump must be running before any Tracktion Engine calls.
 
 ### Ownership Chain
 
@@ -42,9 +46,26 @@ main.cpp
        ├─ JuceQtBridge           JUCE message pump
        ├─ AudioEngine            wraps te::Engine
        ├─ EditManager            wraps te::Edit (the project document)
-       ├─ PluginScanner          VST scan (stub)
+       ├─ PluginScanner          VST/VST3 scan, out of process via OpenDawPluginScanner.exe
+       ├─ PatternManager         patterns (channel rack / step sequencer / playlist placements)
+       ├─ PatternPlayer          plays the current pattern in Pattern mode (live MIDI)
+       ├─ RenderService          offline region render, stems, audio analysis (agent tools)
+       ├─ AiToolExecutor + CommandGateway + LocalApiServer   external agent API (MCP)
        └─ MainWindow             QMainWindow with dock layout
 ```
+
+### Build targets
+
+- `OpenDawCore` (static lib): engine, AI tools, agent API — everything except widgets. JUCE/Tracktion modules are compiled here once; other targets use `opendaw_use_core()` which re-exports the module include dirs and macro set (never link JUCE modules publicly — they'd compile twice).
+- `OpenDaw` (GUI app), `OpenDawPluginScanner` (JUCE console helper that loads one plugin per run), `opendaw-mcp` (Qt console MCP stdio bridge), `OpenDawTests`. Helpers land next to `OpenDaw.exe`.
+
+### Agent API (MCP)
+
+`AiToolExecutor` holds every tool (the in-app chat and external agents share it). Modules add tools through `AiToolExtensionRegistry` providers (`src/ai/AiToolExtensions.h`), registered in `OpenDawApplication::initialize()` before any executor exists. Tool inputs are validated against their JSON schema (`AiSchemaValidator`, unknown properties rejected); errors carry `AiErrorCode::*`; ids are `track:<EditItemID>`, `clip:<id>`, `plugin:<id>`, `pattern:<n>` (`src/ai/AiIds.h`). Mutating tools each get one undo transaction; `run_batch` runs many atomically and rolls back via the undo history — so **any project change a tool makes must be undoable** (pass the Edit's UndoManager; for `AutomatableParameter` use the undoable `setParamUndoable` helper, since `setParameter` alone records nothing). `LocalApiServer` serves MCP JSON-RPC over a per-user local socket on the GUI thread; `opendaw-mcp` relays stdio to it. See `docs/AGENT_API.md`.
+
+### Pattern workflow
+
+Channels are the MIDI tracks; a pattern stores step rows per channel in the Edit state (`OpenDaw_PATTERNS`, written through the UndoManager); placing a pattern creates one tagged MIDI clip per used channel (`OpenDaw_patternId`/`OpenDaw_placementId`), regenerated whenever the pattern changes. UI: `src/ui/channelrack/`, pattern selector + PAT/SONG toggle in `TransportBar`.
 
 `OpenDawApplication` is the single place to access engine/edit globals — never create additional `te::Engine` instances.
 
@@ -60,9 +81,12 @@ main.cpp
 ### UI Layout
 
 `MainWindow` uses Qt dock widgets:
-- **Central widget**: `TimelineView` (arrangement with automation lanes)
+- **Central widget**: `TimelineView` — the "Playlist" (arrangement with automation lanes)
 - **Bottom dock** (tabbed): `MixerView`, `PianoRollEditor`, `AudioClipEditor`, `RoutingView`, `SheetMusicView`
-- **Right dock** (tabbed): `EffectChainWidget` + `FileBrowserPanel` + `AiChatWidget`
+- **Left dock**: `FileBrowserPanel` (full height)
+- **Channel Rack dock**: `ChannelRackView` (step sequencer for the current pattern)
+- **Right dock** (tabbed): `EffectChainWidget` + `AiChatWidget`
+- F5 Playlist, F6 Channel Rack, F7 Piano Roll, F8 Browser, F9 Mixer; Ctrl+P places the current pattern
 - **Top toolbar**: `TransportBar`
 - **Dialogs**: `ExportDialog`, `RecoveryDialog`, `AudioSettingsDialog`
 

@@ -4,6 +4,7 @@
 #include "ui/controls/LevelMeter.h"
 #include "ui/controls/RotaryKnob.h"
 #include "utils/ThemeManager.h"
+#include "ui/ViewRefreshSupport.h"
 #include <QWidget>
 #include <QLabel>
 #include <QLineEdit>
@@ -13,6 +14,7 @@
 #include <QFrame>
 #include <QTimer>
 #include <tracktion_engine/tracktion_engine.h>
+#include <optional>
 #include <vector>
 
 namespace te = tracktion::engine;
@@ -23,11 +25,21 @@ class TrackHeaderWidget : public QWidget {
     Q_OBJECT
 
 public:
+    // `routing` is the rebuild's shared input/output list (queried here when null).
     TrackHeaderWidget(te::AudioTrack* track, EditManager* editMgr,
-                      QWidget* parent = nullptr);
+                      QWidget* parent = nullptr,
+                      const TrackRoutingChoices* routing = nullptr);
     ~TrackHeaderWidget() override;
 
     te::AudioTrack* track() const { return track_; }
+    uint64_t trackId() const { return trackId_; }
+    // False once the track object was destroyed (or after detach()).
+    bool trackAlive() const { return track_ && trackRef_.get() != nullptr; }
+    // The kind of track this header was built for (MIDI headers have an
+    // instrument row, audio ones a takes button); a change means a new header.
+    TrackWidgetKind kind() const { return kind_; }
+    // Before deleteLater(): drop the track and the meter, stop the timer.
+    void detach();
     void setTrackHeight(int h);
     void setSelected(bool sel);
     void setAutomationVisible(bool visible);
@@ -35,7 +47,11 @@ public:
     void setCollapsed(bool collapsed);
     bool isCollapsed() const { return collapsed_; }
     void setIndented(bool indented);
-    void refresh();
+    // Re-reads the track. With `routing` the input/output combo lists are
+    // updated too (otherwise they only reselect). `anySoloed`: whether any
+    // track is soloed, when the caller already knows (saves a track scan).
+    void refresh(const TrackRoutingChoices* routing = nullptr,
+                 std::optional<bool> anySoloed = std::nullopt);
     bool isSelected() const { return selected_; }
     QSize minimumSizeHint() const override;
 
@@ -64,7 +80,10 @@ private:
     void updateMeter();
     void updateSelectionStyle();
     void updateRowVisibility();
-    void refreshNameStyle();
+    void refreshNameStyle(std::optional<bool> anySoloed = std::nullopt);
+    void updateInstrumentButton();
+    void updateTakesButton();
+    void dropLevelMeterClient();
 
     static constexpr int kLeftMargin = metrics::kTrackColourStrip + 6;
     static constexpr int kVMargin = 4;
@@ -75,15 +94,19 @@ private:
     void applyToggleStyle(QPushButton* btn, const QColor& activeColor);
     void updateMonoButtonVisual(bool mono);
     void updateFreezeButtonVisual(bool frozen);
-    void populateInputCombo();
+    void populateInputCombo(const TrackRoutingChoices* routing);
     void onInputComboChanged(int index);
-    void populateOutputCombo();
+    void populateOutputCombo(const TrackRoutingChoices* routing);
     void onOutputComboChanged(int index);
     void onArmToggled(bool armed);
     void startRenameEdit();
 
     te::AudioTrack* track_;
+    juce::WeakReference<te::Selectable> trackRef_;
+    uint64_t trackId_ = 0;
+    TrackWidgetKind kind_ = TrackWidgetKind::Audio;
     EditManager* editMgr_;
+    int frozenShown_ = -1;   // freeze look last applied (-1: none yet)
     bool selected_ = false;
     bool collapsed_ = false;
 
@@ -115,6 +138,7 @@ private:
     bool draggingToReorder_ = false;
     te::LevelMeasurer::Client meterClient_;
     te::LevelMeterPlugin* levelMeterPlugin_ = nullptr;
+    juce::WeakReference<te::Selectable> levelMeterRef_;   // guards levelMeterPlugin_
     double lastTrackedPlayheadSecs_ = -1.0;
 };
 

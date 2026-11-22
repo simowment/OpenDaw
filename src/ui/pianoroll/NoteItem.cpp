@@ -146,6 +146,33 @@ void NoteItem::destroyGhosts()
     ghostItems_.clear();
 }
 
+NoteGrid* NoteItem::grid() const
+{
+    if (!scene() || scene()->views().isEmpty()) return nullptr;
+    return qobject_cast<NoteGrid*>(scene()->views().first());
+}
+
+void NoteItem::startPreview(int pitch)
+{
+    stopPreview();
+    auto* g = grid();
+    if (!g) return;
+    // The note's own clip channel (linked multi-channel clips share a track).
+    int channel = clip_ ? clip_->getMidiChannel().getChannelNumber() : -1;
+    if (channel < 1 || channel > 16) channel = -1;
+    g->playNotePreview(pitch, std::max(1, note_->getVelocity()), channel,
+                       NoteGrid::PreviewSource::Mouse);
+    previewingNote_ = pitch;
+}
+
+void NoteItem::stopPreview()
+{
+    if (previewingNote_ < 0) return;
+    if (auto* g = grid())
+        g->stopNotePreview(previewingNote_);
+    previewingNote_ = -1;
+}
+
 void NoteItem::mousePressEvent(QGraphicsSceneMouseEvent* event)
 {
     if (event->button() != Qt::LeftButton) {
@@ -162,14 +189,7 @@ void NoteItem::mousePressEvent(QGraphicsSceneMouseEvent* event)
     origLengthBeats_ = note_->getLengthBeats().inBeats();
     origPitch_ = note_->getNoteNumber();
 
-    if (clip_) {
-        if (auto* track = clip_->getAudioTrack()) {
-            int vel = std::max(1, note_->getVelocity());
-            auto msg = juce::MidiMessage::noteOn(1, origPitch_, static_cast<juce::uint8>(vel));
-            track->injectLiveMidiMessage(msg, 0);
-            previewingNote_ = origPitch_;
-        }
-    }
+    startPreview(origPitch_);
 
     double localX = event->pos().x();
     constexpr double edgeGrab = 6.0;
@@ -239,6 +259,9 @@ void NoteItem::mouseMoveEvent(QGraphicsSceneMouseEvent* event)
         int newPitch = std::clamp(origPitch_ + pitchDelta, 0, 127);
         int row = (lowestNote_ + totalNotes - 1) - newPitch;
         setPos(newBeat * pixelsPerBeat_, row * noteRowHeight_);
+        // Hear the pitch the note is dragged to (FL Studio behaviour).
+        if (newPitch != previewingNote_)
+            startPreview(newPitch);
 
         for (auto& p : peers_) {
             double pBeat = std::max(0.0, p.origBeat + beatDelta);
@@ -357,13 +380,7 @@ void NoteItem::mouseReleaseEvent(QGraphicsSceneMouseEvent* event)
         }
     }
 
-    if (previewingNote_ >= 0 && clip_) {
-        if (auto* track = clip_->getAudioTrack()) {
-            auto msg = juce::MidiMessage::noteOff(1, previewingNote_);
-            track->injectLiveMidiMessage(msg, 0);
-        }
-        previewingNote_ = -1;
-    }
+    stopPreview();
 
     destroyGhosts();
     dragging_ = false;

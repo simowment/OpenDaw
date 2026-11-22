@@ -12,6 +12,7 @@
 #include <QTimer>
 #include <QMenu>
 #include <algorithm>
+#include <cstdlib>
 
 namespace OpenDaw {
 
@@ -352,6 +353,20 @@ void ClipItem::paint(QPainter* painter,
     QColor trackColour = theme.accent;
     if (editMgr_ && clip_)
         trackColour = editMgr_->getTrackColour(clip_->getTrack());
+    // Clips a pattern placement made take the pattern's colour instead, so
+    // every instance of a pattern on the playlist reads as the same block.
+    if (clip_) {
+        static const juce::Identifier kPatternIdProp("OpenDaw_patternId");
+        if (clip_->state.hasProperty(kPatternIdProp)) {
+            if (clip_->state.hasProperty(te::IDs::colour)) {
+                const auto c = clip_->getColour();
+                trackColour = QColor(c.getRed(), c.getGreen(), c.getBlue());
+            } else if (!theme.trackColours.empty()) {
+                const int id = int(clip_->state.getProperty(kPatternIdProp));
+                trackColour = theme.trackColours[size_t(std::abs(id) % int(theme.trackColours.size()))];
+            }
+        }
+    }
     auto mix = [](const QColor& a, const QColor& b, double t) {
         return QColor(int(a.red() * t + b.red() * (1 - t)),
                       int(a.green() * t + b.green() * (1 - t)),

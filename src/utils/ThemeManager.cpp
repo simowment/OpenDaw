@@ -46,11 +46,70 @@ void finish(Theme& t)
     t.pianoRollVelocityBar = t.accent;
 }
 
+// Panel chrome and step-sequencer colours, for every theme that leaves them unset
+// (Studio Graphite does not call finish(), so this runs separately).
+void finishExtras(Theme& t)
+{
+    if (!t.stepOff.isValid())
+        t.stepOff = t.isLight ? t.surface.darker(110) : mix(t.surfaceLight, t.surface, 0.75);
+    if (!t.stepOffAlt.isValid())
+        t.stepOffAlt = mix(t.stepOff, t.recordArm, 0.82);
+    if (!t.stepOn.isValid())
+        t.stepOn = t.accentLight;
+    if (!t.stepPlaying.isValid())
+        t.stepPlaying = t.meterGreen;
+    if (!t.channelButton.isValid())
+        t.channelButton = t.isLight ? t.surfaceLight : t.surfaceLight.lighter(112);
+    if (!t.dockTitle.isValid())
+        t.dockTitle = t.isLight ? t.surface.darker(106) : mix(t.separator, t.surface, 0.45);
+    if (!t.dockTitleText.isValid())
+        t.dockTitleText = t.textDim;
+    if (!t.selection.isValid())
+        t.selection = t.accent;
+}
+
 std::vector<Theme> makeThemes()
 {
     std::vector<Theme> themes;
 
-    {   // The default: neutral graphite with a blue accent.
+    {   // The default for new installs: slate-grey panels with a warm orange
+        // accent and an orange LCD, flat and compact for pattern work.
+        Theme t;
+        t.name = "Studio Orange";
+        t.background = {47, 52, 57};   t.surface = {59, 65, 72};   t.surfaceLight = {74, 81, 89};
+        t.border = {31, 35, 39};       t.separator = {24, 27, 30};
+        t.text = {222, 226, 230};      t.textDim = {148, 156, 164};
+        t.accent = {255, 154, 46};     t.accentLight = {255, 192, 116};
+        t.playhead = {132, 224, 116};
+        t.lcdText = {255, 162, 62};    t.lcdBackground = {20, 22, 25};
+        t.controlBody = {88, 96, 105}; t.controlTrack = {27, 30, 34}; t.controlHandle = {212, 216, 222};
+        t.meterGreen = {122, 214, 98}; t.meterYellow = {240, 200, 72}; t.meterRed = {240, 78, 62};
+        t.muteButton = {236, 140, 40}; t.soloButton = {122, 214, 98}; t.recordArm = {234, 74, 60};
+        t.transportPlay = {122, 214, 98}; t.transportStop = {206, 210, 216};
+        // Same palette as Studio Graphite: EditManager maps explicit track
+        // colours from older projects onto slots of the first theme's palette.
+        t.trackColours = {
+            {84, 150, 214}, {214, 96, 92}, {96, 178, 112}, {222, 148, 72},
+            {146, 110, 212}, {214, 186, 72}, {64, 170, 164}, {204, 100, 172},
+            {150, 190, 82}, {100, 116, 214}, {214, 112, 140}, {158, 138, 116},
+        };
+        finish(t);
+        t.pianoRollNote = {140, 210, 112};
+        t.pianoRollVelocityBar = {140, 210, 112};
+        t.pianoRollNoteSelected = {255, 154, 46};
+        t.stepOn = {255, 164, 66};
+        t.stepOff = {80, 88, 97};
+        t.stepOffAlt = {98, 78, 78};
+        t.stepPlaying = {140, 232, 112};
+        t.channelButton = {86, 94, 103};
+        t.dockTitle = {36, 40, 45};
+        t.dockTitleText = {172, 180, 188};
+        t.selection = {214, 124, 34};
+        t.cornerRadius = 2;
+        themes.push_back(t);
+    }
+
+    {   // Neutral graphite with a blue accent.
         Theme t;
         t.name = "Studio Graphite";
         t.trackColours = {
@@ -298,6 +357,8 @@ std::vector<Theme> makeThemes()
         themes.push_back(t);
     }
 
+    for (auto& t : themes)
+        finishExtras(t);
     return themes;
 }
 
@@ -308,6 +369,12 @@ const char* kThemeSettingsKey = "ui/theme";
 ThemeManager::ThemeManager()
     : theme_(builtInThemes().front())
 {
+}
+
+void ThemeManager::setCurrent(const Theme& t)
+{
+    theme_ = t;
+    finishExtras(theme_);
 }
 
 ThemeManager& ThemeManager::instance()

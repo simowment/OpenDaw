@@ -73,6 +73,7 @@ private:
 
 struct TrackLayoutInfo {
     int trackIndex = 0;
+    te::EditItemID trackId;   // the row's track: view state follows it across rebuilds
     double yOffset = 0.0;
     double clipRowHeight = 96.0;
     bool automationVisible = false;
@@ -157,7 +158,21 @@ public slots:
 
 private:
     bool eventFilter(QObject* watched, QEvent* event) override;
+    // Header sync + scene rebuild when the header heights required it.
     void rebuildTrackHeaders();
+    // Brings the header column in line with the display items: keeps the
+    // headers of tracks/folders still shown, retires the rest first (before
+    // anything reads their tracks), creates headers only for new ones and
+    // reorders. Returns true when the scene must be rebuilt (row heights
+    // changed); the caller does that, so one change rebuilds it once.
+    bool syncTrackHeaders();
+    TrackHeaderWidget* createTrackHeader(te::AudioTrack* track, const TrackRoutingChoices& routing);
+    FolderHeaderWidget* createFolderHeader(int folderId);
+    void retireTrackHeader(TrackHeaderWidget* header);
+    void retireFolderHeader(FolderHeaderWidget* header);
+    // True when the track headers still show exactly the visible tracks.
+    bool trackHeadersMatchVisibleTracks() const;
+    void updateTempoDisplay();
     void drawGridLines();
     void updatePlayhead();
     void updateRecordingPreviews();
@@ -301,6 +316,12 @@ private:
     juce::Array<te::AudioTrack*> getVisibleTracks() const;
 
     bool insideTracksChanged_ = false;
+    bool editChangedWhileInTracksChanged_ = false;
+    // Edit change count the clips and headers last showed: an editChanged
+    // with an equal count (the one following tracksChanged for the same
+    // operation) has nothing to rebuild.
+    EditStateStamp editStamp_;
+    uint64_t shownStamp_ = 0;
 
     // Live track/folder reorder state
     int reorderDragSourceIndex_ = -1;

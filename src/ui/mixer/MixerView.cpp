@@ -6,6 +6,7 @@
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QMimeData>
+#include <unordered_map>
 
 namespace OpenDaw {
 namespace {
@@ -73,7 +74,7 @@ MixerView::MixerView(EditManager* editMgr, QWidget* parent)
     // Master strip on the right
     auto* sep = new QFrame(this);
     sep->setFrameShape(QFrame::VLine);
-    sep->setStyleSheet(QString("color: %1;").arg(theme.border.name()));
+    sep->setStyleSheet(QString("color: %1;").arg(theme.separator.name()));
     mainLayout->addWidget(sep);
 
     masterStrip_ = ChannelStrip::createMasterStrip(editMgr_, this);
@@ -82,7 +83,7 @@ MixerView::MixerView(EditManager* editMgr, QWidget* parent)
 
     auto* sep2 = new QFrame(this);
     sep2->setFrameShape(QFrame::VLine);
-    sep2->setStyleSheet(QString("color: %1;").arg(theme.border.name()));
+    sep2->setStyleSheet(QString("color: %1;").arg(theme.separator.name()));
     mainLayout->addWidget(sep2);
     mainLayout->addWidget(new LoudnessPanel(editMgr_, this));
 
@@ -92,6 +93,9 @@ MixerView::MixerView(EditManager* editMgr, QWidget* parent)
             delete s;
         }
         strips_.clear();
+        routing_ = {};
+        editStamp_.detach();
+        shownStamp_ = 0;
     });
 
     connect(editMgr_, &EditManager::tracksChanged,
@@ -104,49 +108,127 @@ MixerView::MixerView(EditManager* editMgr, QWidget* parent)
     rebuildStrips();
 }
 
+void MixerView::retireStrip(ChannelStrip* s)
+{
+    // Only cut strip -> MixerView connections. A bare s->disconnect() also drops
+    // the destroyed() connection Qt's accessibility cache relies on, leaving a
+    // dangling accessible interface that crashes when UI Automation is active.
+    disconnect(s, nullptr, this, nullptr);
+    // The strip lives until deleteLater runs, so also stop it reacting to
+    // edit signals (its track may be gone). detach() drops the track and the
+    // meter at once: from here on nothing in the strip touches either.
+    QObject::disconnect(editMgr_, nullptr, s, nullptr);
+    s->detach();
+    stripLayout_->removeWidget(s);
+    s->hide();
+    s->deleteLater();
+}
+
+bool MixerView::stripsMatchTracks(const juce::Array<te::AudioTrack*>& tracks) const
+{
+    if (static_cast<int>(strips_.size()) != tracks.size())
+        return false;
+    for (int i = 0; i < tracks.size(); ++i) {
+        const auto* s = strips_[size_t(i)];
+        auto* t = tracks[i];
+        if (!s->trackAlive() || s->track() != t || s->trackId() != t->itemID.getRawID()
+            || s->kind() != trackWidgetKind(*editMgr_, t))
+            return false;
+    }
+    return true;
+}
+
 void MixerView::rebuildStrips()
 {
+    juce::Array<te::AudioTrack*> tracks;
+    if (editMgr_->edit())
+        tracks = editMgr_->getAudioTracksInDisplayOrder();
+
+    std::unordered_map<uint64_t, te::AudioTrack*> live;
+    live.reserve(size_t(tracks.size()));
+    for (auto* t : tracks)
+        live.emplace(t->itemID.getRawID(), t);
+
+    // Retire first: a strip whose track is gone (or was replaced by another
+    // object, e.g. by an undo, or changed kind) stops before anything below
+    // can reach it. Pointers are only compared here, never dereferenced.
+    std::unordered_map<uint64_t, ChannelStrip*> kept;
     for (auto* s : strips_) {
-        // Only cut strip -> MixerView connections. A bare s->disconnect() also drops
-        // the destroyed() connection Qt's accessibility cache relies on, leaving a
-        // dangling accessible interface that crashes when UI Automation is active.
-        disconnect(s, nullptr, this, nullptr);
-        // The strip lives until deleteLater runs, so also stop it reacting to
-        // the same edit signals that triggered this rebuild (its track may be gone).
-        QObject::disconnect(editMgr_, nullptr, s, nullptr);
-        s->detach();
-        stripLayout_->removeWidget(s);
-        s->hide();
-        s->deleteLater();
+        auto it = live.find(s->trackId());
+        const bool keep = it != live.end()
+            && s->trackAlive() && s->track() == it->second
+            && s->kind() == trackWidgetKind(*editMgr_, it->second)
+            && kept.find(s->trackId()) == kept.end();
+        if (keep)
+            kept.emplace(s->trackId(), s);
+        else
+            retireStrip(s);
     }
     strips_.clear();
 
-    auto tracks = editMgr_->getAudioTracksInDisplayOrder();
-    bool selectedTrackStillExists = false;
-    for (auto* track : tracks) {
-        if (track == selectedTrack_) {
-            selectedTrackStillExists = true;
-            break;
-        }
-    }
-    if (!selectedTrackStillExists)
+    // By pointer only: the selected track may be the one just deleted.
+    if (selectedTrack_ && !tracks.contains(selectedTrack_))
         selectedTrack_ = nullptr;
 
+    // One device and bus query for every strip.
+    routing_ = editMgr_->edit() ? TrackRoutingChoices::query(*editMgr_) : TrackRoutingChoices{};
+
+    std::vector<ChannelStrip*> ordered;
+    ordered.reserve(size_t(tracks.size()));
     for (auto* track : tracks) {
-        auto* strip = new ChannelStrip(track, editMgr_, stripContainer_);
-        connect(strip, &ChannelStrip::instrumentSelectRequested,
-                this, &MixerView::instrumentSelectRequested);
+        ChannelStrip* strip = nullptr;
+        auto it = kept.find(track->itemID.getRawID());
+        if (it != kept.end()) {
+            strip = it->second;
+            strip->refresh(&routing_);
+        } else {
+            strip = new ChannelStrip(track, editMgr_, stripContainer_, &routing_);
+            connect(strip, &ChannelStrip::instrumentSelectRequested,
+                    this, &MixerView::instrumentSelectRequested);
+            strip->refresh();   // arm, mute and solo as saved
+        }
         strip->setSelected(track == selectedTrack_);
-        strip->refresh();   // arm, mute and solo as saved
-        stripLayout_->addWidget(strip);
-        strips_.push_back(strip);
+        ordered.push_back(strip);
     }
+
+    // Put the strips in display order, touching the layout only if it changed.
+    bool sameOrder = stripLayout_->count() == static_cast<int>(ordered.size());
+    for (int i = 0; sameOrder && i < static_cast<int>(ordered.size()); ++i)
+        sameOrder = stripLayout_->itemAt(i) && stripLayout_->itemAt(i)->widget() == ordered[size_t(i)];
+    if (!sameOrder) {
+        for (auto* s : ordered)
+            stripLayout_->removeWidget(s);
+        for (auto* s : ordered)
+            stripLayout_->addWidget(s);
+    }
+    strips_ = std::move(ordered);
+
+    shownStamp_ = editStamp_.sync(editMgr_->edit());
 }
 
 void MixerView::refreshStrips()
 {
+    juce::Array<te::AudioTrack*> tracks;
+    if (editMgr_->edit())
+        tracks = editMgr_->getAudioTracksInDisplayOrder();
+
+    // A track went (or came) without tracksChanged: rebuild rather than let
+    // a strip read a deleted track.
+    if (!stripsMatchTracks(tracks)) {
+        rebuildStrips();
+        return;
+    }
+
+    // tracksChanged just rebuilt the strips for this very change.
+    const auto stamp = editStamp_.sync(editMgr_->edit());
+    if (stamp == shownStamp_)
+        return;
+
+    // Combos keep the lists of the last rebuild (routingChanged and
+    // tracksChanged rebuild them) and only reselect here.
     for (auto* strip : strips_)
         strip->refresh();
+    shownStamp_ = stamp;
 }
 
 void MixerView::setSelectedTrack(te::AudioTrack* track)

@@ -29,6 +29,8 @@ class AudioClipEditor;
 class SheetMusicView;
 class VideoPlayerWidget;
 class LooperWindow;
+class ChannelRackView;
+class TypingKeyboard;
 
 class ShortcutFilter : public QObject {
     Q_OBJECT
@@ -62,6 +64,18 @@ private:
     void openRecentProject(const QString& path);
     void onImportAudio();
     void onImportMidi();
+    void importAudioFiles(const QStringList& paths);
+    void importMidiFile(const QString& path);
+    void importBrowserFile(const QString& path);
+    // Pattern workflow
+    void placeCurrentPattern();
+    void focusPlaylist();
+    // F-key panel switching: shows and raises the panel, or hides it when it
+    // is already in front.
+    void togglePanel(QDockWidget* dock);
+    void copyMcpSetupCommand();
+    void updateAgentApiLabel(int clients);
+    QWidget* createPlaylistPanel();
     void restoreWindowLayout();
     void saveWindowLayout();
     void fixDockTabBars();
@@ -84,13 +98,39 @@ private:
     void onRemoveTrack();
     void onSplitClipAtPlayhead();
     void onScanVstPlugins();
+    void onClearBlacklistAndRescan();
+    void connectPluginScanner();
+    // Picks Surge XT for a track; its first scan runs off the GUI thread.
+    void chooseSurgeXt(te::EditItemID trackId);
     void onEffectInsertRequested(te::AudioTrack* track, int slotIndex);
     void onInstrumentSelectRequested(te::AudioTrack* track);
     void onMidiClipDoubleClicked(te::MidiClip* clip);
+    // Piano roll <-> channels and patterns (FL Studio style).
+    // Shows a clip; a pattern clip gets the "Pattern: ... Channel: ..." header.
+    void showMidiClipInPianoRoll(te::MidiClip* clip);
+    // Shows a channel of the current pattern ("Pattern 1" is made when the
+    // Edit has none). createClip: make the placement clip now (an explicit
+    // "edit in piano roll"); otherwise the clip is made by the first note.
+    void openPianoRollForChannel(te::AudioTrack* track, bool createClip, bool raiseDock);
+    // A track was selected anywhere: it becomes the piano roll's preview
+    // target; from the Channel Rack it also retargets a piano roll in front.
+    void onTrackSelectedForPianoRoll(te::AudioTrack* track, bool fromChannelRack);
+    void refreshPianoRollPattern();
+    void onCurrentPatternChangedForPianoRoll(int patternId);
+    bool isPianoRollInFront() const;
+    bool isPatternChannel(te::AudioTrack* track) const;
+    bool pianoRollShowsChannel(te::AudioTrack* track) const;
+    te::MidiClip* findPatternClip(int patternId, te::AudioTrack* track) const;
     void onAudioClipDoubleClicked(te::WaveAudioClip* clip);
     void onSplitPianoHands(te::AudioTrack* track);
     void onHandSplitFinished(const QVector<bool>& isLeftHand, int fallbackNotes);
     void closeHandSplitProgress();
+
+private slots:
+    // ChannelRackView::pianoRollRequested (double-click / "Edit in Piano Roll").
+    void onChannelPianoRollRequested(te::AudioTrack* track);
+
+private:
 
     OpenDawApplication& app_;
     EditManager& editMgr_;
@@ -110,6 +150,8 @@ private:
     QMenu*             recentMenu_ = nullptr;
     QProgressDialog*   handSplitProgress_ = nullptr;
     VideoPlayerWidget* videoPlayer_   = nullptr;
+    ChannelRackView*   channelRack_   = nullptr;
+    QWidget*           playlistPanel_ = nullptr;
 
     QDockWidget* mixerDock_           = nullptr;
     QDockWidget* effectsDock_         = nullptr;
@@ -120,6 +162,7 @@ private:
     QDockWidget* sheetMusicDock_     = nullptr;
     QDockWidget* videoPlayerDock_    = nullptr;
     QDockWidget* aiDock_              = nullptr;
+    QDockWidget* channelRackDock_     = nullptr;
 
     QToolBar* transportToolBar_       = nullptr;
     QToolBar* mainToolBar_            = nullptr;
@@ -127,13 +170,20 @@ private:
     QActionGroup* editToolGroup_      = nullptr;
     QAction* rippleAction_            = nullptr;
     QAction* looperAction_            = nullptr;
+    QAction* placePatternAction_      = nullptr;
     LooperWindow* looperWindow_       = nullptr;
     void showLooper(bool show);
 
     QLabel* sampleRateLabel_          = nullptr;
     QLabel* bufferLabel_              = nullptr;
     QLabel* cpuLabel_                 = nullptr;
+    QLabel* agentApiLabel_            = nullptr;
     QTimer* statusBarTimer_           = nullptr;
+    int scanFailures_                 = 0;     // plugins that failed in the running scan
+    bool surgeScanRunning_            = false;
+    TypingKeyboard* typingKeyboard_ = nullptr;   // computer keyboard -> selected channel
+    QAction* typingKeyboardAction_ = nullptr;
+    te::EditItemID selectedTrackId_;           // the last track selected anywhere
 };
 
 } // namespace OpenDaw

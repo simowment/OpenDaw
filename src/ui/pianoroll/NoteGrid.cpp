@@ -6,6 +6,8 @@
 #include <QMouseEvent>
 #include <QMenu>
 #include <QShowEvent>
+#include <QHideEvent>
+#include <QFocusEvent>
 #include <QTimer>
 #include <QGraphicsRectItem>
 #include <QGraphicsSceneMouseEvent>
@@ -125,13 +127,7 @@ void NoteGrid::setEditMode(EditMode mode)
 
 void NoteGrid::updateSceneSize()
 {
-    double clipLenBeats = 16.0;
-    if (primaryClip_) {
-        auto& ts = primaryClip_->edit.tempoSequence;
-        double startBeat = ts.toBeats(primaryClip_->getPosition().getStart()).inBeats();
-        double endBeat = ts.toBeats(primaryClip_->getPosition().getEnd()).inBeats();
-        clipLenBeats = endBeat - startBeat;
-    }
+    double clipLenBeats = (primaryClip_ || fixedLengthBeats_ > 0.0) ? regionLengthBeats() : 16.0;
     double totalBeats = std::max(clipLenBeats + 16.0, 32.0);
     double w = totalBeats * pixelsPerBeat_;
     double h = TOTAL_NOTES * noteRowHeight_;
@@ -154,13 +150,7 @@ void NoteGrid::drawBackground()
     if (clipRegionLeft_) { scene_->removeItem(clipRegionLeft_); delete clipRegionLeft_; clipRegionLeft_ = nullptr; }
     if (clipRegionRight_) { scene_->removeItem(clipRegionRight_); delete clipRegionRight_; clipRegionRight_ = nullptr; }
 
-    double clipLenBeats = 4.0;
-    if (primaryClip_) {
-        auto& ts = primaryClip_->edit.tempoSequence;
-        double startBeat = ts.toBeats(primaryClip_->getPosition().getStart()).inBeats();
-        double endBeat = ts.toBeats(primaryClip_->getPosition().getEnd()).inBeats();
-        clipLenBeats = endBeat - startBeat;
-    }
+    double clipLenBeats = regionLengthBeats();
     double clipEndX = clipLenBeats * pixelsPerBeat_;
 
     for (int note = 0; note < TOTAL_NOTES; ++note) {
@@ -207,9 +197,29 @@ void NoteGrid::drawBackground()
     }
 }
 
+double NoteGrid::regionLengthBeats() const
+{
+    if (fixedLengthBeats_ > 0.0) return fixedLengthBeats_;
+    if (!primaryClip_) return 4.0;
+    auto& ts = primaryClip_->edit.tempoSequence;
+    double startBeat = ts.toBeats(primaryClip_->getPosition().getStart()).inBeats();
+    double endBeat = ts.toBeats(primaryClip_->getPosition().getEnd()).inBeats();
+    return endBeat - startBeat;
+}
+
+void NoteGrid::setFixedLengthBeats(double beats)
+{
+    const double v = beats > 0.0 ? beats : 0.0;
+    if (std::abs(v - fixedLengthBeats_) < 1.0e-9) return;
+    fixedLengthBeats_ = v;
+    updateSceneSize();
+    rebuildNotes();
+}
+
 void NoteGrid::expandClipToFitNotes()
 {
-    if (!primaryClip_) return;
+    // A pattern clip is as long as its pattern: never stretch it here.
+    if (!primaryClip_ || fixedLengthBeats_ > 0.0) return;
 
     auto& ts = primaryClip_->edit.tempoSequence;
     double clipStartBeat = ts.toBeats(primaryClip_->getPosition().getStart()).inBeats();
@@ -390,6 +400,11 @@ void NoteGrid::mouseReleaseEvent(QMouseEvent* event)
     }
 
     QGraphicsView::mouseReleaseEvent(event);
+
+    // A note item that was rebuilt (deleted) while its button was held never
+    // gets its release: end every mouse preview once no button is down.
+    if (event->buttons() == Qt::NoButton)
+        stopPreviews(PreviewSource::Mouse);
 }
 
 void NoteGrid::wheelEvent(QWheelEvent* event)
@@ -927,50 +942,111 @@ void NoteGrid::legatoSelectedNotes()
 
 // ── Note preview (audition) ───────────────────────────────────────────
 
-void NoteGrid::playNotePreview(int noteNumber, int velocity)
+void NoteGrid::setPreviewTarget(te::AudioTrack* track, int midiChannel)
 {
-    if (!primaryClip_) return;
-    auto* track = primaryClip_->getAudioTrack();
+    previewTrack_ = track;
+    previewTargetChannel_ = std::clamp(midiChannel, 1, 16);
+}
+
+te::AudioTrack* NoteGrid::previewTrack() const
+{
+    if (primaryClip_)
+        if (auto* t = primaryClip_->getAudioTrack())
+            return t;
+    return previewTrack_.get();
+}
+
+int NoteGrid::previewChannel() const
+{
+    if (primaryClip_) {
+        const int ch = primaryClip_->getMidiChannel().getChannelNumber();
+        if (ch >= 1 && ch <= 16) return ch;
+        return 1;
+    }
+    return previewTargetChannel_;
+}
+
+void NoteGrid::playNotePreview(int noteNumber, int velocity, int channel, PreviewSource source)
+{
+    auto* track = previewTrack();
     if (!track) return;
 
     noteNumber = std::clamp(noteNumber, 0, 127);
     velocity = std::clamp(velocity, 1, 127);
+    if (channel < 1 || channel > 16) channel = previewChannel();
 
     if (activePreviewNotes_.count(noteNumber))
         stopNotePreview(noteNumber);
 
-    auto msg = juce::MidiMessage::noteOn(1, noteNumber, static_cast<juce::uint8>(velocity));
+    auto msg = juce::MidiMessage::noteOn(channel, noteNumber, static_cast<juce::uint8>(velocity));
     track->injectLiveMidiMessage(msg, 0);
-    activePreviewNotes_.insert(noteNumber);
+    activePreviewNotes_[noteNumber] = ActivePreview{ te::SafeSelectable<te::AudioTrack>(track),
+                                                     channel, source };
 }
 
 void NoteGrid::stopNotePreview(int noteNumber)
 {
-    if (!primaryClip_ || !activePreviewNotes_.count(noteNumber)) return;
-    auto* track = primaryClip_->getAudioTrack();
-    if (!track) return;
+    auto it = activePreviewNotes_.find(noteNumber);
+    if (it == activePreviewNotes_.end()) return;
+    if (auto* track = it->second.track.get())
+        track->injectLiveMidiMessage(juce::MidiMessage::noteOff(it->second.channel, noteNumber), 0);
+    activePreviewNotes_.erase(it);
+}
 
-    auto msg = juce::MidiMessage::noteOff(1, noteNumber);
-    track->injectLiveMidiMessage(msg, 0);
-    activePreviewNotes_.erase(noteNumber);
+void NoteGrid::stopPreviews(PreviewSource source)
+{
+    for (auto it = activePreviewNotes_.begin(); it != activePreviewNotes_.end();) {
+        if (it->second.source == source) {
+            if (auto* track = it->second.track.get())
+                track->injectLiveMidiMessage(
+                    juce::MidiMessage::noteOff(it->second.channel, it->first), 0);
+            it = activePreviewNotes_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 void NoteGrid::stopAllPreviews()
 {
-    if (!primaryClip_) {
-        activePreviewNotes_.clear();
-        return;
-    }
-    auto* track = primaryClip_->getAudioTrack();
-    if (!track) {
-        activePreviewNotes_.clear();
-        return;
-    }
-    for (int note : activePreviewNotes_) {
-        auto msg = juce::MidiMessage::noteOff(1, note);
-        track->injectLiveMidiMessage(msg, 0);
-    }
+    for (auto& [note, p] : activePreviewNotes_)
+        if (auto* track = p.track.get())
+            track->injectLiveMidiMessage(juce::MidiMessage::noteOff(p.channel, note), 0);
     activePreviewNotes_.clear();
+}
+
+bool NoteGrid::event(QEvent* event)
+{
+    // Musical typing owns its letter keys: without this, single-key window
+    // shortcuts (S = split clip, ...) would take them before keyPressEvent.
+    if (event->type() == QEvent::ShortcutOverride && musicalTypingEnabled_) {
+        auto* ke = static_cast<QKeyEvent*>(event);
+        const auto mods = ke->modifiers() & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier);
+        const int key = ke->key();
+        if (mods == Qt::NoModifier
+            && (musicalTypingKeyToPitch(key) >= 0 || key == Qt::Key_Z || key == Qt::Key_X
+                || key == Qt::Key_C || key == Qt::Key_V)) {
+            event->accept();
+            return true;
+        }
+    }
+    return QGraphicsView::event(event);
+}
+
+void NoteGrid::hideEvent(QHideEvent* event)
+{
+    stopAllPreviews();
+    heldTypingKeys_.clear();
+    QGraphicsView::hideEvent(event);
+}
+
+void NoteGrid::focusOutEvent(QFocusEvent* event)
+{
+    // Key releases go to the new focus widget: end typed notes now. Mouse
+    // previews end on the button release (the view keeps the mouse grab).
+    stopPreviews(PreviewSource::Typing);
+    heldTypingKeys_.clear();
+    QGraphicsView::focusOutEvent(event);
 }
 
 // ── Musical typing ────────────────────────────────────────────────────
@@ -1120,7 +1196,7 @@ void NoteGrid::keyPressEvent(QKeyEvent* event)
         int pitch = musicalTypingKeyToPitch(key);
         if (pitch >= 0 && !event->isAutoRepeat()) {
             heldTypingKeys_.insert(key);
-            playNotePreview(pitch, typingVelocity_);
+            playNotePreview(pitch, typingVelocity_, -1, PreviewSource::Typing);
             insertNoteAtCursor(pitch);
             event->accept();
             return;
@@ -1306,7 +1382,9 @@ void NoteGrid::showEvent(QShowEvent* event)
 
 void NoteGrid::beginDrawPreview(const QPointF& scenePos)
 {
-    if (!primaryClip_) return;
+    // No clip yet: drawing is still possible when one can be made on the
+    // first note (a pattern channel without a placement yet).
+    if (!primaryClip_ && !(clipOnDemand_ && ensureClipCb_)) return;
 
     double beat = scenePos.x() / pixelsPerBeat_;
     beat = snapper_.snapBeat(beat);
@@ -1318,7 +1396,7 @@ void NoteGrid::beginDrawPreview(const QPointF& scenePos)
     drawStartBeat_ = beat;
     drawCurrentBeat_ = beat;
     isDrawingNote_ = true;
-    playNotePreview(drawPitch_, drawVelocity_);
+    playNotePreview(drawPitch_, drawVelocity_, -1, PreviewSource::Mouse);
 
     if (!drawPreviewItem_) {
         auto& theme = ThemeManager::instance().current();

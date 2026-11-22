@@ -9,10 +9,26 @@
 #include <QPainter>
 #include <QPaintEvent>
 #include <QToolTip>
+#include <QPointer>
 #include <algorithm>
 #include <cmath>
+#include <optional>
 
 namespace {
+// Restyling is expensive (Qt re-polishes the widget): skip it when unchanged.
+void setStyleSheetIfChanged(QWidget* w, const QString& css)
+{
+    if (w && w->styleSheet() != css)
+        w->setStyleSheet(css);
+}
+
+// The theme's corner rounding, as a style sheet declaration.
+QString radiusCss(int max = 3)
+{
+    const int r = std::min(max, OpenDaw::ThemeManager::instance().current().cornerRadius);
+    return QString("border-radius: %1px; ").arg(std::max(0, r));
+}
+
 float dbToNormalized(float db) {
     constexpr float minDb = -60.0f;
     constexpr float maxDb = 6.0f;
@@ -25,25 +41,28 @@ float dbToNormalized(float db) {
 namespace OpenDaw {
 
 ChannelStrip::ChannelStrip(te::AudioTrack* track, EditManager* editMgr,
-                           QWidget* parent)
+                           QWidget* parent, const TrackRoutingChoices* routing)
     : QWidget(parent), track_(track),
       trackId_(track ? track->itemID.getRawID() : 0),
+      kind_(track && editMgr ? trackWidgetKind(*editMgr, track) : TrackWidgetKind::Audio),
       editMgr_(editMgr)
 {
+    trackRef_ = track;
     setAccessibleName("Channel Strip");
-    setupUI();
+    setupUI(routing);
 
     reconnectLevelMeterSource();
 
     if (editMgr_) {
         connect(editMgr_, &EditManager::aboutToChangeEdit, this, [this]() {
-            if (levelMeterPlugin_) {
-                levelMeterPlugin_->measurer.removeClient(meterClient_);
-                levelMeterPlugin_ = nullptr;
-            }
+            dropLevelMeterClient();
         });
+        // Track strips re-resolve their meter in refresh(), which MixerView
+        // calls only after checking the strip's track still exists. Reading
+        // track_ straight from editChanged could touch a deleted track.
         connect(editMgr_, &EditManager::editChanged, this, [this]() {
-            reconnectLevelMeterSource();
+            if (isMaster_)
+                reconnectLevelMeterSource();
         });
     }
 
@@ -54,24 +73,31 @@ ChannelStrip::ChannelStrip(te::AudioTrack* track, EditManager* editMgr,
 ChannelStrip::~ChannelStrip()
 {
     meterTimer_.stop();
-    if (levelMeterPlugin_)
-        levelMeterPlugin_->measurer.removeClient(meterClient_);
+    dropLevelMeterClient();
 }
 
 void ChannelStrip::detach()
 {
     meterTimer_.stop();
-    if (levelMeterPlugin_) {
-        levelMeterPlugin_->measurer.removeClient(meterClient_);
-        levelMeterPlugin_ = nullptr;
-    }
+    dropLevelMeterClient();
     track_ = nullptr;
+    trackRef_ = nullptr;
+}
+
+void ChannelStrip::dropLevelMeterClient()
+{
+    // The plugin may already be gone with its track: only a live one still
+    // holds our client.
+    if (levelMeterPlugin_ && levelMeterRef_.get() != nullptr)
+        levelMeterPlugin_->measurer.removeClient(meterClient_);
+    levelMeterPlugin_ = nullptr;
+    levelMeterRef_ = nullptr;
 }
 
 QColor ChannelStrip::stripColour() const
 {
-    if (isMaster_ || !track_ || !editMgr_)
-        return QColor(150, 154, 162);
+    if (isMaster_ || !trackAlive() || !editMgr_)
+        return ThemeManager::instance().current().textDim;
     return editMgr_->getTrackColour(track_);
 }
 
@@ -80,10 +106,11 @@ void ChannelStrip::paintEvent(QPaintEvent*)
     auto& theme = ThemeManager::instance().current();
     QPainter p(this);
 
+    // Nearly flat: a faint top-to-bottom shade only.
     QLinearGradient bg(0, 0, 0, height());
     const QColor base = selected_ ? theme.surfaceLight : theme.surface;
-    bg.setColorAt(0.0, base.lighter(108));
-    bg.setColorAt(1.0, base.darker(108));
+    bg.setColorAt(0.0, base.lighter(103));
+    bg.setColorAt(1.0, base.darker(104));
     p.fillRect(rect(), bg);
 
     // Track colour band along the top, separator on the right.
@@ -100,10 +127,11 @@ void ChannelStrip::applyNameStyle()
 {
     if (!nameLabel_) return;
     const QColor c = stripColour();
-    const QColor bg = isMaster_ ? QColor(70, 72, 78) : c.darker(150);
-    nameLabel_->setStyleSheet(
+    const auto& theme = ThemeManager::instance().current();
+    const QColor bg = isMaster_ ? theme.surfaceLight : c.darker(150);
+    setStyleSheetIfChanged(nameLabel_,
         QString("QLabel { color: %1; font-size: 11px; font-weight: bold; "
-                "background: %2; border-left: 3px solid %3; border-radius: 2px; padding: 3px; }")
+                "background: %2; border-left: 3px solid %3; " + radiusCss(2) + "padding: 3px; }")
             .arg(ThemeManager::readableTextOn(bg).name(), bg.name(), c.name()));
 }
 
@@ -117,9 +145,16 @@ ChannelStrip* ChannelStrip::createMasterStrip(EditManager* editMgr,
     return strip;
 }
 
-void ChannelStrip::setupUI()
+void ChannelStrip::setupUI(const TrackRoutingChoices* routing)
 {
     auto& theme = ThemeManager::instance().current();
+
+    // A strip built on its own (not by MixerView) queries the devices itself.
+    std::optional<TrackRoutingChoices> ownRouting;
+    if (!routing && track_ && editMgr_) {
+        ownRouting = TrackRoutingChoices::query(*editMgr_);
+        routing = &*ownRouting;
+    }
     setObjectName("channelStrip");
     setAttribute(Qt::WA_StyledBackground, true);
     setFixedWidth(92);
@@ -133,7 +168,7 @@ void ChannelStrip::setupUI()
 
     // ── Top section: input routing, name, instrument, pan ──
 
-    bool isMidi = track_ && editMgr_ && editMgr_->isMidiTrack(track_);
+    const bool isMidi = track_ && kind_ == TrackWidgetKind::Midi;
 
     inputCombo_ = new QComboBox(this);
     inputCombo_->setAccessibleName("Input Source");
@@ -148,7 +183,7 @@ void ChannelStrip::setupUI()
                 "selection-background-color: %4; font-size: 9px; }")
             .arg(theme.text.name(), theme.accent.name(),
                  theme.surface.name(), theme.surfaceLight.name()));
-    populateInputCombo();
+    populateInputCombo(routing);
     connect(inputCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &ChannelStrip::onInputComboChanged);
     layout->addWidget(inputCombo_);
@@ -166,7 +201,7 @@ void ChannelStrip::setupUI()
                 "selection-background-color: %4; font-size: 9px; }")
             .arg(theme.text.name(), theme.accent.name(),
                  theme.surface.name(), theme.surfaceLight.name()));
-    populateOutputCombo();
+    populateOutputCombo(routing);
     connect(outputCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &ChannelStrip::onOutputComboChanged);
     layout->addWidget(outputCombo_);
@@ -183,7 +218,7 @@ void ChannelStrip::setupUI()
                  theme.border.name(), theme.accent.name()));
     connect(sendsBtn_, &QPushButton::clicked, this, [this]() {
         // Parented to the window: a routing change rebuilds the mixer's strips.
-        if (track_)
+        if (trackAlive())
             SendsPanel::showFor(editMgr_, track_,
                                 sendsBtn_->mapToGlobal(QPoint(0, sendsBtn_->height())),
                                 window());
@@ -194,7 +229,7 @@ void ChannelStrip::setupUI()
     nameLabel_ = new QLabel(this);
     nameLabel_->setAccessibleName("Track Name");
     nameLabel_->setToolTip("Double-click to rename");
-    if (track_)
+    if (trackAlive())
         nameLabel_->setText(QString::fromStdString(track_->getName().toStdString()));
     nameLabel_->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
     nameLabel_->setMinimumWidth(10);
@@ -204,15 +239,11 @@ void ChannelStrip::setupUI()
     layout->addWidget(nameLabel_);
 
     if (isMidi) {
-        auto* instrument = editMgr_->getTrackInstrument(track_);
-        QString instrName = instrument
-            ? QString::fromStdString(instrument->getName().toStdString())
-            : "No Instrument";
         auto* instrumentRow = new QHBoxLayout();
         instrumentRow->setSpacing(2);
-        instrumentBtn_ = new QPushButton(instrName, this);
+        instrumentBtn_ = new QPushButton(this);
         instrumentBtn_->setAccessibleName("Select Instrument");
-        instrumentBtn_->setToolTip(instrName + "\nClick to change the instrument");
+        updateInstrumentButton();
         instrumentBtn_->setFixedHeight(kInstrumentRowHeight);
         instrumentBtn_->setMinimumWidth(10);
         instrumentBtn_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
@@ -223,7 +254,7 @@ void ChannelStrip::setupUI()
                     "QPushButton:hover { background: " + theme.surfaceLight.name() + "; }")
                 .arg(theme.text.name()));
         connect(instrumentBtn_, &QPushButton::clicked, this, [this]() {
-            emit instrumentSelectRequested(track_);
+            if (trackAlive()) emit instrumentSelectRequested(track_);
         });
         instrumentRow->addWidget(instrumentBtn_, 1);
 
@@ -281,7 +312,7 @@ void ChannelStrip::setupUI()
             return;
         }
 
-        if (!track_) return;
+        if (!trackAlive()) return;
         for (auto* plugin : track_->pluginList.getPlugins()) {
             if (auto* volPan = dynamic_cast<te::VolumeAndPanPlugin*>(plugin)) {
                 volPan->panParam->setParameter(float(v), juce::sendNotification);
@@ -333,7 +364,7 @@ void ChannelStrip::setupUI()
             return;
         }
 
-        if (!track_) return;
+        if (!trackAlive()) return;
         for (auto* plugin : track_->pluginList.getPlugins()) {
             if (auto* volPan = dynamic_cast<te::VolumeAndPanPlugin*>(plugin)) {
                 if (v <= 0.001) {
@@ -360,7 +391,7 @@ void ChannelStrip::setupUI()
     muteBtn_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     applyToggleStyle(muteBtn_, theme.muteButton);
     connect(muteBtn_, &QPushButton::toggled, this, [this](bool m) {
-        if (track_) track_->setMute(m);
+        if (trackAlive()) track_->setMute(m);
     });
 
     soloBtn_ = new QPushButton(this);
@@ -371,7 +402,7 @@ void ChannelStrip::setupUI()
     soloBtn_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     applyToggleStyle(soloBtn_, theme.soloButton);
     connect(soloBtn_, &QPushButton::toggled, this, [this](bool s) {
-        if (track_) track_->setSolo(s);
+        if (trackAlive()) track_->setSolo(s);
     });
 
     armBtn_ = new QPushButton(this);
@@ -391,7 +422,7 @@ void ChannelStrip::setupUI()
     monoBtn_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     applyToggleStyle(monoBtn_, theme.accent);
     connect(monoBtn_, &QPushButton::toggled, this, [this](bool mono) {
-        if (!track_ || !editMgr_) return;
+        if (!trackAlive() || !editMgr_) return;
         editMgr_->setTrackMono(*track_, mono);
         updateMonoButtonVisual(mono);
     });
@@ -421,7 +452,7 @@ void ChannelStrip::setupUI()
     connect(autoModeBtn_, &QPushButton::clicked, this, [this]() {
         if (!editMgr_ || !editMgr_->edit()) return;
 
-        te::Track* modeTrack = track_;
+        te::Track* modeTrack = trackAlive() ? track_ : nullptr;
         if (isMaster_)
             modeTrack = editMgr_->edit()->getMasterTrack();
         if (!modeTrack) return;
@@ -456,21 +487,8 @@ void ChannelStrip::setupUI()
         updateMonoButtonVisual(mono);
     }
 
-    if (track_ && editMgr_) {
-        connect(editMgr_, &EditManager::tracksChanged, this, [this]() {
-            if (!monoBtn_ || !editMgr_) return;
-            te::AudioTrack* t = nullptr;
-            for (auto* tr : editMgr_->getAudioTracks()) {
-                if (tr->itemID.getRawID() == trackId_) { t = tr; break; }
-            }
-            if (!t) return;
-            track_ = t;
-            const bool mono = editMgr_->isTrackMono(track_);
-            QSignalBlocker block(monoBtn_);
-            monoBtn_->setChecked(mono);
-            updateMonoButtonVisual(mono);
-        });
-    }
+    // Mono, like the rest of the strip, is re-read by refresh(): MixerView
+    // calls it for every surviving strip on tracksChanged.
 
     frozenLabel_ = new QLabel("FROZEN", this);
     frozenLabel_->setAccessibleName("Track Frozen Indicator");
@@ -539,7 +557,7 @@ void ChannelStrip::setSelected(bool selected)
     updateSelectionStyle();
 }
 
-void ChannelStrip::refresh()
+void ChannelStrip::refresh(const TrackRoutingChoices* routing)
 {
     if (isMaster_) {
         if (editMgr_ && editMgr_->edit()) {
@@ -558,8 +576,10 @@ void ChannelStrip::refresh()
         return;
     }
 
-    if (!track_) return;
-    nameLabel_->setText(QString::fromStdString(track_->getName().toStdString()));
+    if (!trackAlive()) return;
+    const QString name = QString::fromStdString(track_->getName().toStdString());
+    if (nameLabel_->text() != name)
+        nameLabel_->setText(name);
     applyNameStyle();
     updateSendsButton();
     update();
@@ -600,11 +620,19 @@ void ChannelStrip::refresh()
     updateVolumeLabel();
     updateAutoModeButton();
 
-    if (editMgr_ && inputCombo_)
-        populateInputCombo();
-    if (editMgr_ && outputCombo_)
-        populateOutputCombo();
-    if (midiChannelCombo_ && track_) {
+    populateInputCombo(routing);
+    populateOutputCombo(routing);
+    updateInstrumentButton();
+    if (frozenLabel_ && editMgr_) {
+        const bool frozen = editMgr_->isTrackFrozen(track_);
+        if (frozenLabel_->isVisibleTo(this) != frozen)
+            frozenLabel_->setVisible(frozen);
+    }
+    // The track's plugin list may have changed (or the track been replaced
+    // by an undo): follow its current meter.
+    if (track_->getLevelMeterPlugin() != levelMeterPlugin_ || levelMeterRef_.get() == nullptr)
+        reconnectLevelMeterSource();
+    if (midiChannelCombo_ && trackAlive()) {
         int ch = 1;
         for (auto* clip : track_->getClips()) {
             if (auto* mc = dynamic_cast<te::MidiClip*>(clip)) {
@@ -612,8 +640,24 @@ void ChannelStrip::refresh()
                 break;
             }
         }
-        QSignalBlocker block(midiChannelCombo_);
-        midiChannelCombo_->setCurrentIndex(std::clamp(ch, 1, 16) - 1);
+        const int idx = std::clamp(ch, 1, 16) - 1;
+        if (midiChannelCombo_->currentIndex() != idx) {
+            QSignalBlocker block(midiChannelCombo_);
+            midiChannelCombo_->setCurrentIndex(idx);
+        }
+    }
+}
+
+void ChannelStrip::updateInstrumentButton()
+{
+    if (!instrumentBtn_ || !trackAlive() || !editMgr_) return;
+    auto* instrument = editMgr_->getTrackInstrument(track_);
+    const QString instrName = instrument
+        ? QString::fromStdString(instrument->getName().toStdString())
+        : "No Instrument";
+    if (instrumentBtn_->text() != instrName) {
+        instrumentBtn_->setText(instrName);
+        instrumentBtn_->setToolTip(instrName + "\nClick to change the instrument");
     }
 }
 
@@ -666,7 +710,7 @@ void ChannelStrip::updateMeter()
         return;
     }
 
-    if (!track_) return;
+    if (!trackAlive()) return;
 
     auto mode = track_->automationMode.get();
     bool isWriting = isPlaying && (mode == te::AutomationMode::write);
@@ -691,10 +735,7 @@ void ChannelStrip::updateMeter()
 
 void ChannelStrip::reconnectLevelMeterSource()
 {
-    if (levelMeterPlugin_) {
-        levelMeterPlugin_->measurer.removeClient(meterClient_);
-        levelMeterPlugin_ = nullptr;
-    }
+    dropLevelMeterClient();
 
     if (!editMgr_ || !editMgr_->edit())
         return;
@@ -704,12 +745,14 @@ void ChannelStrip::reconnectLevelMeterSource()
                                 ->getMasterPluginList()
                                 .getPluginsOfType<te::LevelMeterPlugin>();
         levelMeterPlugin_ = masterMeters.isEmpty() ? nullptr : masterMeters.getLast();
-    } else if (track_) {
+    } else if (trackAlive()) {
         levelMeterPlugin_ = track_->getLevelMeterPlugin();
     }
 
-    if (levelMeterPlugin_)
+    if (levelMeterPlugin_) {
+        levelMeterRef_ = levelMeterPlugin_;
         levelMeterPlugin_->measurer.addClient(meterClient_);
+    }
 }
 
 void ChannelStrip::applyToggleStyle(QPushButton* btn, const QColor& activeColor)
@@ -717,7 +760,7 @@ void ChannelStrip::applyToggleStyle(QPushButton* btn, const QColor& activeColor)
     auto& theme = ThemeManager::instance().current();
     btn->setStyleSheet(
         QString("QPushButton { background: %4; color: %1; border: 1px solid %5; "
-                "border-radius: 3px; font-weight: bold; font-size: 11px; padding: 1px 2px; }"
+                + radiusCss() + "font-weight: bold; font-size: 11px; padding: 1px 2px; }"
                 "QPushButton:hover { background: %6; color: %7; }"
                 "QPushButton:checked { background: %2; color: #111; border-color: %3; }")
             .arg(theme.textDim.name(), activeColor.name(),
@@ -740,7 +783,7 @@ void ChannelStrip::updateAutoModeButton()
     auto& theme = ThemeManager::instance().current();
 
     auto mode = te::AutomationMode::read;
-    if (track_) {
+    if (trackAlive()) {
         mode = track_->automationMode.get();
     } else if (isMaster_ && editMgr_ && editMgr_->edit()) {
         if (auto* mt = editMgr_->edit()->getMasterTrack())
@@ -773,9 +816,9 @@ void ChannelStrip::updateAutoModeButton()
             break;
     }
 
-    autoModeBtn_->setText(text);
-    QColor bgAlpha(bg.red(), bg.green(), bg.blue(), 180);
-    autoModeBtn_->setStyleSheet(
+    if (autoModeBtn_->text() != text)
+        autoModeBtn_->setText(text);
+    setStyleSheetIfChanged(autoModeBtn_,
         QString("QPushButton { background: rgba(%1,%2,%3,%4); color: %5; "
                 "border: 1px solid " + theme.border.name() + "; "
                 "border-radius: 3px; font-size: 7px; font-weight: bold; padding: 0px 2px; }"
@@ -784,43 +827,29 @@ void ChannelStrip::updateAutoModeButton()
             .arg(fg.name(), theme.accent.name()));
 }
 
-void ChannelStrip::populateInputCombo()
+void ChannelStrip::populateInputCombo(const TrackRoutingChoices* routing)
 {
-    if (!inputCombo_ || !editMgr_) return;
+    // The master strip's combos are hidden; track strips only.
+    if (!inputCombo_ || !editMgr_ || !trackAlive()) return;
 
-    QSignalBlocker block(inputCombo_);
-    inputCombo_->clear();
-    inputCombo_->addItem("No Input", QString());
+    if (routing)
+        setComboItemsIfChanged(inputCombo_,
+                               routing->inputItemsFor(kind_ == TrackWidgetKind::Midi));
 
-    bool isMidi = track_ && editMgr_->isMidiTrack(track_);
-
-    if (isMidi) {
-        auto midiSources = editMgr_->getAvailableMidiInputSources();
-        for (const auto& src : midiSources)
-            inputCombo_->addItem(src.displayName,
-                                 QString("midi:") + QString::fromStdString(
-                                     src.deviceName.toStdString()));
-    }
-
-    auto sources = editMgr_->getAvailableInputSources();
-    for (const auto& src : sources)
-        inputCombo_->addItem(src.displayName,
-                             QString::fromStdString(src.deviceName.toStdString()));
-
-    QString currentInput = track_ ? editMgr_->getTrackInputName(track_) : QString();
+    const QString currentInput = editMgr_->getTrackInputName(track_);
     if (currentInput.isEmpty()) {
-        inputCombo_->setCurrentIndex(0);
+        if (inputCombo_->currentIndex() != 0) {
+            QSignalBlocker block(inputCombo_);
+            inputCombo_->setCurrentIndex(0);
+        }
     } else {
-        int idx = inputCombo_->findData(currentInput);
-        if (idx < 0)
-            idx = inputCombo_->findData("midi:" + currentInput);
-        inputCombo_->setCurrentIndex(idx >= 0 ? idx : 0);
+        selectComboData(inputCombo_, currentInput, "midi:" + currentInput);
     }
 }
 
 void ChannelStrip::onInputComboChanged(int index)
 {
-    if (!track_ || !editMgr_ || index < 0) return;
+    if (!trackAlive() || !editMgr_ || index < 0) return;
 
     QString deviceName = inputCombo_->itemData(index).toString();
     if (deviceName.isEmpty()) {
@@ -838,29 +867,25 @@ void ChannelStrip::onInputComboChanged(int index)
     }
 }
 
-void ChannelStrip::populateOutputCombo()
+void ChannelStrip::populateOutputCombo(const TrackRoutingChoices* routing)
 {
-    if (!outputCombo_ || !editMgr_) return;
+    if (!outputCombo_ || !editMgr_ || !trackAlive()) return;
 
-    QSignalBlocker block(outputCombo_);
-    outputCombo_->clear();
-    for (const auto& choice : editMgr_->getOutputChoices(track_))
-        outputCombo_->addItem(choice.label, choice.key);
-
-    if (!track_) return;
-    int idx = outputCombo_->findData(editMgr_->currentOutputKey(track_));
-    outputCombo_->setCurrentIndex(idx >= 0 ? idx : 0);
+    if (routing)
+        setComboItemsIfChanged(outputCombo_,
+                               toComboItems(routing->outputChoicesFor(*editMgr_, track_)));
+    selectComboData(outputCombo_, editMgr_->currentOutputKey(track_));
 }
 
 void ChannelStrip::onOutputComboChanged(int index)
 {
-    if (!track_ || !editMgr_ || index < 0) return;
+    if (!trackAlive() || !editMgr_ || index < 0) return;
     editMgr_->setTrackOutputByKey(*track_, outputCombo_->itemData(index).toString());
 }
 
 void ChannelStrip::onArmToggled(bool armed)
 {
-    if (!track_ || !editMgr_) return;
+    if (!trackAlive() || !editMgr_) return;
 
     QString currentInput = editMgr_->getTrackInputName(track_);
     if (armed && currentInput.isEmpty()) {
@@ -877,7 +902,7 @@ void ChannelStrip::onArmToggled(bool armed)
 
 void ChannelStrip::onMidiChannelChanged(int index)
 {
-    if (!track_ || index < 0) return;
+    if (!trackAlive() || index < 0) return;
     int ch = midiChannelCombo_->itemData(index).toInt();
     te::MidiChannel midiCh(ch);
     for (auto* clip : track_->getClips()) {
@@ -947,7 +972,7 @@ bool ChannelStrip::eventFilter(QObject* obj, QEvent* event)
 
 void ChannelStrip::startRenameEdit()
 {
-    if (!track_ || !editMgr_) return;
+    if (!trackAlive() || !editMgr_) return;
 
     auto* edit = new QLineEdit(this);
     edit->setAccessibleName("Rename Track");
@@ -964,12 +989,19 @@ void ChannelStrip::startRenameEdit()
 
     auto trackId = trackId_;
     auto* mgr = editMgr_;
-    auto* nameLbl = nameLabel_;
+    QPointer<QLabel> nameLbl = nameLabel_;
 
     connect(edit, &QLineEdit::editingFinished, edit, [edit, trackId, mgr, nameLbl]() {
         QString newName = edit->text().trimmed();
         edit->hide();
         edit->deleteLater();
+        // The strip survives the rename now (it is no longer rebuilt), so
+        // bring its label back here.
+        if (nameLbl) {
+            if (!newName.isEmpty())
+                nameLbl->setText(newName);
+            nameLbl->show();
+        }
         if (!newName.isEmpty() && mgr) {
             QTimer::singleShot(0, mgr, [trackId, mgr, newName]() {
                 for (auto* t : mgr->getAudioTracks()) {
@@ -980,8 +1012,6 @@ void ChannelStrip::startRenameEdit()
                     }
                 }
             });
-        } else if (nameLbl) {
-            nameLbl->show();
         }
     });
 }
@@ -993,7 +1023,7 @@ void ChannelStrip::updateSelectionStyle()
 
 void ChannelStrip::updateSendsButton()
 {
-    if (!sendsBtn_ || !track_ || !editMgr_) return;
+    if (!sendsBtn_ || !trackAlive() || !editMgr_) return;
     const auto sends = editMgr_->getTrackSends(track_);
     if (sends.empty()) {
         sendsBtn_->setText(QString::fromUtf8("Sends \u25BE"));

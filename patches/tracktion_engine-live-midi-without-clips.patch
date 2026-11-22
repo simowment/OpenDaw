@@ -1,0 +1,15 @@
+diff --git a/modules/tracktion_engine/playback/graph/tracktion_EditNodeBuilder.cpp b/modules/tracktion_engine/playback/graph/tracktion_EditNodeBuilder.cpp
+index 4ef6714..0160189 100644
+--- a/modules/tracktion_engine/playback/graph/tracktion_EditNodeBuilder.cpp
++++ b/modules/tracktion_engine/playback/graph/tracktion_EditNodeBuilder.cpp
+@@ -1470,6 +1470,10 @@ std::unique_ptr<tracktion::graph::Node> createNodeForAudioTrack (AudioTrack& at,
+ 
+         if (! node)
+             return {};
++
++        // OpenDaw: a synth-only track (no clips yet) must still accept live
++        // MIDI (note previews, pattern playback), so give the stub an injector.
++        node = makeNode<LiveMidiInjectingNode> (at, std::move (node));
+     }
+ 
+     if (liveInputNode)

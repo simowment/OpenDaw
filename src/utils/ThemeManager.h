@@ -68,6 +68,18 @@ struct Theme {
 
     // Colours tracks cycle through. Tracks store a slot, so they follow the theme.
     std::vector<QColor> trackColours;
+
+    // Channel rack / step sequencer and panel chrome. Left invalid here: a theme
+    // that does not set them gets them derived from its core palette.
+    QColor stepOn;          // a step that plays
+    QColor stepOff;         // an empty step
+    QColor stepOffAlt;      // empty steps in every other group of four
+    QColor stepPlaying;     // the step under the pattern playhead
+    QColor channelButton;   // channel name buttons in the rack
+    QColor dockTitle;       // panel title bars
+    QColor dockTitleText;
+    QColor selection;       // list and tree selection
+    int cornerRadius = 4;   // buttons, fields and menus (px)
 };
 
 class ThemeManager {
@@ -75,7 +87,7 @@ public:
     static ThemeManager& instance();
 
     const Theme& current() const { return theme_; }
-    void setCurrent(const Theme& t) { theme_ = t; }
+    void setCurrent(const Theme& t);   // fills any derived colour t leaves unset
 
     static const std::vector<Theme>& builtInThemes();
     bool setCurrentByName(const QString& name);   // false if there is no such theme

@@ -64,12 +64,42 @@ add_subdirectory(libs/JUCE)
 
 # ── Tracktion Engine (detects JUCE automatically) ────────────────────────────
 set(TE_ADD_EXAMPLES OFF CACHE BOOL "" FORCE)
+# ── Local patches to the Tracktion submodule ────────────────────────────────
+# Applied in place at configure time (idempotent: skipped once applied), so
+# the submodule stays pinned to its upstream commit.
+foreach(_patch ${CMAKE_SOURCE_DIR}/patches/tracktion_engine-live-midi-without-clips.patch)
+    execute_process(COMMAND git apply --reverse --check "${_patch}"
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/libs/tracktion_engine
+        RESULT_VARIABLE _already OUTPUT_QUIET ERROR_QUIET)
+    if(NOT _already EQUAL 0)
+        execute_process(COMMAND git apply "${_patch}"
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/libs/tracktion_engine
+            RESULT_VARIABLE _applied)
+        if(NOT _applied EQUAL 0)
+            message(FATAL_ERROR "Could not apply ${_patch} to libs/tracktion_engine")
+        endif()
+        message(STATUS "Applied ${_patch}")
+    endif()
+endforeach()
+
 add_subdirectory(libs/tracktion_engine)
 
-# ── Source files ─────────────────────────────────────────────────────────────
-set(OpenDaw_SOURCES
-    src/main.cpp
-    src/app/OpenDawApplication.h    src/app/OpenDawApplication.cpp
+# ── Compile definitions shared by everything that compiles engine code ──────
+set(OPENDAW_DEFS
+    JUCE_PLUGINHOST_VST=1
+    JUCE_PLUGINHOST_VST3=1
+    JUCE_PLUGINHOST_LADSPA=0
+    JUCE_USE_CURL=0
+    JUCE_WEB_BROWSER=0
+    JUCE_MODAL_LOOPS_PERMITTED=1
+    JUCE_STRICT_REFCOUNTEDPOINTER=1
+    DONT_SET_USING_JUCE_NAMESPACE=1
+    TRACKTION_ENABLE_TIMESTRETCH_SOUNDTOUCH=1)
+
+# ── Core library: engine, AI tools and the agent API (no widgets) ────────────
+# Linked by the app, the tests and anything else that drives the engine. The
+# JUCE/Tracktion module code is compiled once, here.
+set(OpenDawCore_SOURCES
     src/app/JuceQtBridge.h          src/app/JuceQtBridge.cpp
     src/engine/AudioEngine.h        src/engine/AudioEngine.cpp
     src/engine/LoudnessMeter.h      src/engine/LoudnessMeter.cpp
@@ -79,7 +109,80 @@ set(OpenDaw_SOURCES
     src/engine/instruments/BundledPlugins.h src/engine/instruments/BundledPlugins.cpp
     src/engine/EditManager.h        src/engine/EditManager.cpp
     src/engine/PluginScanner.h      src/engine/PluginScanner.cpp
+    src/engine/PatternManager.h     src/engine/PatternManager.cpp
+    src/engine/AudioFileAnalyzer.h  src/engine/AudioFileAnalyzer.cpp
+    src/utils/WaveformCache.h       src/utils/WaveformCache.cpp
+    src/utils/ThemeManager.h        src/utils/ThemeManager.cpp
+    src/utils/FFmpegUtils.h         src/utils/FFmpegUtils.cpp
+    src/ai/AiTypes.h
+    src/ai/AiIds.h
+    src/ai/AiToolExtensions.h
+    src/ai/AiSchemaValidator.h     src/ai/AiSchemaValidator.cpp
+    src/ai/AiAudioAnalysis.h      src/ai/AiAudioAnalysis.cpp
+    src/ai/AiToolDefs.h            src/ai/AiToolDefs.cpp
+    src/ai/AiToolExecutor.h        src/ai/AiToolExecutor.cpp
+    src/ai/AiService.h             src/ai/AiService.cpp
+    src/ai/AiChatStore.h           src/ai/AiChatStore.cpp
+    src/ai/AiHandSplitter.h        src/ai/AiHandSplitter.cpp
+    src/api/RenderService.h        src/api/RenderService.cpp
+    src/api/PatternTools.h         src/api/PatternTools.cpp
+    src/api/CommandGateway.h       src/api/CommandGateway.cpp
+    src/api/LocalApiServer.h       src/api/LocalApiServer.cpp
+)
+
+add_library(OpenDawCore STATIC ${OpenDawCore_SOURCES})
+target_compile_definitions(OpenDawCore
+    PUBLIC  ${OPENDAW_DEFS} OpenDaw_VERSION="${OpenDaw_DISPLAY_VERSION}"
+    PRIVATE JUCE_STANDALONE_APPLICATION=1)
+target_include_directories(OpenDawCore PUBLIC
+    ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/libs/vst2sdk
+    ${CMAKE_SOURCE_DIR}/libs/tinysoundfont ${FFMPEG_INCLUDE_DIRS})
+target_link_directories(OpenDawCore PUBLIC ${FFMPEG_LIBRARY_DIRS})
+target_link_libraries(OpenDawCore
+    PUBLIC
+        Qt6::Core Qt6::Gui Qt6::Network Qt6::Concurrent
+        ${FFMPEG_LINK_TARGET}
+        $<$<PLATFORM_ID:Windows>:winmm>
+    PRIVATE
+        tracktion::tracktion_core
+        tracktion::tracktion_engine
+        tracktion::tracktion_graph
+        juce::juce_audio_basics
+        juce::juce_audio_devices
+        juce::juce_audio_formats
+        juce::juce_audio_processors
+        juce::juce_audio_utils
+        juce::juce_core
+        juce::juce_events
+        juce::juce_recommended_warning_flags)
+if(MSVC)
+    target_compile_options(OpenDawCore PRIVATE /EHsc /bigobj)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+    target_compile_options(OpenDawCore PRIVATE -Wno-unknown-pragmas)
+endif()
+
+# Consumers see the module headers and the exact macro set the modules were
+# compiled with, without compiling the modules again (JUCE's own pattern for
+# plugin wrappers: linking the modules publicly would duplicate them).
+function(opendaw_use_core tgt)
+    target_link_libraries(${tgt} PRIVATE OpenDawCore)
+    target_include_directories(${tgt} PRIVATE
+        $<TARGET_GENEX_EVAL:OpenDawCore,$<TARGET_PROPERTY:OpenDawCore,INCLUDE_DIRECTORIES>>)
+    target_compile_definitions(${tgt} PRIVATE
+        $<TARGET_GENEX_EVAL:OpenDawCore,$<TARGET_PROPERTY:OpenDawCore,COMPILE_DEFINITIONS>>)
+    if(MSVC)
+        target_compile_options(${tgt} PRIVATE /EHsc /bigobj)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+        target_compile_options(${tgt} PRIVATE -Wno-unknown-pragmas)
+    endif()
+endfunction()
+
+# ── GUI sources ──────────────────────────────────────────────────────────────
+set(OpenDaw_SOURCES
+    src/main.cpp
+    src/app/OpenDawApplication.h    src/app/OpenDawApplication.cpp
     src/ui/MainWindow.h             src/ui/MainWindow.cpp
+    src/ui/TypingKeyboard.h         src/ui/TypingKeyboard.cpp
     src/ui/timeline/TimelineView.h  src/ui/timeline/TimelineView.cpp
     src/ui/timeline/TimeRuler.h     src/ui/timeline/TimeRuler.cpp
     src/ui/timeline/TrackLane.h     src/ui/timeline/TrackLane.cpp
@@ -136,19 +239,18 @@ set(OpenDaw_SOURCES
     src/ui/sheetmusic/ScoreScene.h        src/ui/sheetmusic/ScoreScene.cpp
     src/ui/browser/FileBrowserPanel.h    src/ui/browser/FileBrowserPanel.cpp
     src/ui/SplashScreen.h           src/ui/SplashScreen.cpp
-    src/utils/WaveformCache.h       src/utils/WaveformCache.cpp
-    src/utils/ThemeManager.h        src/utils/ThemeManager.cpp
-    src/utils/IconFont.h
-    src/ai/AiTypes.h
-    src/ai/AiAudioAnalysis.h      src/ai/AiAudioAnalysis.cpp
-    src/ai/AiToolDefs.h            src/ai/AiToolDefs.cpp
-    src/ai/AiToolExecutor.h        src/ai/AiToolExecutor.cpp
-    src/ai/AiService.h             src/ai/AiService.cpp
-    src/ai/AiChatStore.h           src/ai/AiChatStore.cpp
+    src/ui/channelrack/ChannelRackView.h src/ui/channelrack/ChannelRackView.cpp
+    src/ui/channelrack/ChannelRow.h      src/ui/channelrack/ChannelRow.cpp
+    src/ui/channelrack/StepRow.h         src/ui/channelrack/StepRow.cpp
+    src/ui/channelrack/ChannelSound.h    src/ui/channelrack/ChannelSound.cpp
+    src/ui/channelrack/SoundPicker.h     src/ui/channelrack/SoundPicker.cpp
+    src/ui/channelrack/SampleBrowserDialog.h src/ui/channelrack/SampleBrowserDialog.cpp
+    src/ui/channelrack/SamplePreviewPlayer.h src/ui/channelrack/SamplePreviewPlayer.cpp
+    src/ui/toolbar/PatternSelector.h     src/ui/toolbar/PatternSelector.cpp
+    src/ui/toolbar/DockTitleBar.h        src/ui/toolbar/DockTitleBar.cpp
     src/ai/AiChatWidget.h          src/ai/AiChatWidget.cpp
     src/ai/AiQuickPrompt.h         src/ai/AiQuickPrompt.cpp
-    src/ai/AiHandSplitter.h        src/ai/AiHandSplitter.cpp
-    src/utils/FFmpegUtils.h        src/utils/FFmpegUtils.cpp
+    src/utils/IconFont.h
     src/video/VideoThumbnailCache.h src/video/VideoThumbnailCache.cpp
     src/ui/timeline/VideoTrackLane.h src/ui/timeline/VideoTrackLane.cpp
     src/ui/video/VideoPlayerWidget.h src/ui/video/VideoPlayerWidget.cpp
@@ -165,9 +267,8 @@ juce_add_gui_app(OpenDaw
     MICROPHONE_PERMISSION_ENABLED TRUE
     MICROPHONE_PERMISSION_TEXT "OpenDaw needs microphone access for audio recording")
 
-juce_generate_juce_header(OpenDaw)
-
 target_sources(OpenDaw PRIVATE ${OpenDaw_SOURCES})
+opendaw_use_core(OpenDaw)
 
 # ── Windows application icon ─────────────────────────────────────────────────
 # JUCE's generated RC expects icon.ico next to OpenDaw_resources.rc
@@ -185,8 +286,6 @@ qt_add_resources(OpenDaw "OpenDaw_resources" PREFIX "/" BASE resources FILES
     resources/MaterialSymbolsOutlined.ttf
     resources/mixerStripBG.png
     resources/Bravura.otf)
-target_include_directories(OpenDaw PRIVATE src ${CMAKE_SOURCE_DIR}/libs/vst2sdk
-    ${CMAKE_SOURCE_DIR}/libs/tinysoundfont ${FFMPEG_INCLUDE_DIRS})
 
 # ── Built-in instrument sounds ───────────────────────────────────────────────
 # GeneralUser GS v2.0.3 by S. Christian Collins, a free General MIDI SoundFont
@@ -318,48 +417,68 @@ if(OPENDAW_BUNDLE_SURGE_XT)
             COMMENT "Copying the Surge XT synth")
     endif()
 endif()
-target_link_directories(OpenDaw PRIVATE ${FFMPEG_LIBRARY_DIRS})
-
-target_compile_definitions(OpenDaw PRIVATE
-    JUCE_PLUGINHOST_VST=1
-    JUCE_PLUGINHOST_VST3=1
-    JUCE_PLUGINHOST_LADSPA=0
-    JUCE_USE_CURL=0
-    JUCE_WEB_BROWSER=0
-    JUCE_MODAL_LOOPS_PERMITTED=1
-    JUCE_STRICT_REFCOUNTEDPOINTER=1
-    DONT_SET_USING_JUCE_NAMESPACE=1
-    TRACKTION_ENABLE_TIMESTRETCH_SOUNDTOUCH=1)
-
 target_link_libraries(OpenDaw PRIVATE
     Qt6::Widgets
-    Qt6::Network
-    Qt6::Concurrent
     Qt6::PrintSupport
-    tracktion::tracktion_core
-    tracktion::tracktion_engine
-    tracktion::tracktion_graph
-    juce::juce_audio_basics
-    juce::juce_audio_devices
-    juce::juce_audio_formats
+    juce::juce_recommended_warning_flags)
+
+
+# ── Helper executables, placed next to OpenDaw so they ship with it ──────────
+set(OPENDAW_TOOLS_OUTPUT_DIR "${CMAKE_BINARY_DIR}/OpenDaw_artefacts/$<CONFIG>")
+if(APPLE)
+    set(OPENDAW_TOOLS_OUTPUT_DIR "${CMAKE_BINARY_DIR}/OpenDaw_artefacts/$<CONFIG>/OpenDaw.app/Contents/MacOS")
+endif()
+
+# Out-of-process plugin scanner: loads one plugin binary per run, so a plugin
+# that crashes while being scanned takes down this helper, not the DAW.
+juce_add_console_app(OpenDawPluginScanner PRODUCT_NAME "OpenDawPluginScanner")
+target_sources(OpenDawPluginScanner PRIVATE src/tools/PluginScannerMain.cpp)
+target_compile_definitions(OpenDawPluginScanner PRIVATE ${OPENDAW_DEFS} JUCE_STANDALONE_APPLICATION=1)
+target_include_directories(OpenDawPluginScanner PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/libs/vst2sdk)
+target_link_libraries(OpenDawPluginScanner PRIVATE
     juce::juce_audio_processors
-    juce::juce_audio_utils
-    juce::juce_core
-    juce::juce_events
-    juce::juce_recommended_warning_flags
-    ${FFMPEG_LINK_TARGET})
-
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
-    target_compile_options(OpenDaw PRIVATE -Wno-unknown-pragmas)
-endif()
-
+    juce::juce_recommended_warning_flags)
+set_target_properties(OpenDawPluginScanner PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${OPENDAW_TOOLS_OUTPUT_DIR}")
 if(MSVC)
-    target_compile_options(OpenDaw PRIVATE /EHsc /bigobj)
+    target_compile_options(OpenDawPluginScanner PRIVATE /EHsc /bigobj)
 endif()
+add_dependencies(OpenDaw OpenDawPluginScanner)
 
-target_compile_definitions(OpenDaw PRIVATE
-    OpenDaw_VERSION="${OpenDaw_DISPLAY_VERSION}")
+# MCP stdio server for external agents (Claude Code, Codex, ...). Relays MCP
+# JSON-RPC between stdin/stdout and the running OpenDaw over a local socket.
+qt_add_executable(opendaw-mcp src/tools/McpBridgeMain.cpp)
+target_link_libraries(opendaw-mcp PRIVATE Qt6::Core Qt6::Network)
+target_include_directories(opendaw-mcp PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(opendaw-mcp PRIVATE OpenDaw_VERSION="${OpenDaw_DISPLAY_VERSION}")
+set_target_properties(opendaw-mcp PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${OPENDAW_TOOLS_OUTPUT_DIR}")
+add_dependencies(OpenDaw opendaw-mcp)
 
-if(WIN32)
-    target_link_libraries(OpenDaw PRIVATE winmm)
+# ── Tests ────────────────────────────────────────────────────────────────────
+option(OPENDAW_BUILD_TESTS "Build the OpenDaw integration tests" ON)
+if(OPENDAW_BUILD_TESTS)
+    enable_testing()
+    find_package(Qt6 REQUIRED COMPONENTS Test)
+    file(GLOB OPENDAW_TEST_SOURCES CONFIGURE_DEPENDS
+        ${CMAKE_SOURCE_DIR}/tests/*.cpp ${CMAKE_SOURCE_DIR}/tests/*.h)
+    qt_add_executable(OpenDawTests ${OPENDAW_TEST_SOURCES}
+        # Widget-free Channel Rack logic (tst_ChannelRackFl).
+        src/ui/channelrack/ChannelSound.h src/ui/channelrack/ChannelSound.cpp
+        # Typing keyboard (tst_TypingKeyboard; needs a QApplication).
+        src/ui/TypingKeyboard.h src/ui/TypingKeyboard.cpp)
+    opendaw_use_core(OpenDawTests)
+    target_include_directories(OpenDawTests PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+    target_compile_definitions(OpenDawTests PRIVATE
+        OPENDAW_TOOLS_DIR="$<TARGET_FILE_DIR:OpenDaw>"
+        OPENDAW_SOUNDFONT_DIR="${OPENDAW_SOUNDFONT_DIR}")
+    target_link_libraries(OpenDawTests PRIVATE Qt6::Test Qt6::Gui Qt6::Widgets)
+    add_dependencies(OpenDawTests OpenDawPluginScanner opendaw-mcp)
+    add_test(NAME OpenDawTests COMMAND OpenDawTests)
+    set_tests_properties(OpenDawTests PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 600)
+    if(WIN32)
+        get_target_property(_qmake Qt6::qmake IMPORTED_LOCATION)
+        get_filename_component(_qt_bin "${_qmake}" DIRECTORY)
+        set_tests_properties(OpenDawTests PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:${_qt_bin};PATH=path_list_prepend:$<TARGET_FILE_DIR:OpenDaw>")
+    endif()
 endif()

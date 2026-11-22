@@ -9,6 +9,7 @@ namespace te = tracktion::engine;
 namespace OpenDaw {
 
 class GridSnapper;
+class NoteGrid;
 
 class NoteItem : public QGraphicsRectItem {
 public:
@@ -45,6 +46,9 @@ protected:
 
 private:
     void showEditDialog();
+    NoteGrid* grid() const;
+    void startPreview(int pitch);   // plays through the grid (it tracks the note-off)
+    void stopPreview();
     void collectPeers();
     void createGhosts();
     void destroyGhosts();

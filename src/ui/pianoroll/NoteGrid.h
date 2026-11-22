@@ -10,8 +10,11 @@
 #include <vector>
 #include <unordered_set>
 #include <set>
+#include <map>
 
 class QShowEvent;
+class QHideEvent;
+class QFocusEvent;
 
 namespace te = tracktion::engine;
 
@@ -96,10 +99,28 @@ public:
     void setStepRecordEnabled(bool enabled);
     bool stepRecordEnabled() const { return stepRecordEnabled_; }
 
-    // Note preview (audition through virtual instrument)
-    void playNotePreview(int noteNumber, int velocity = 100);
+    // Note preview (audition through the track's instrument, as live MIDI).
+    // The sound goes to the primary clip's track on the clip's MIDI channel;
+    // with no clip loaded, to the preview target (setPreviewTarget). Every
+    // note-on is remembered with the track and channel it went to, so its
+    // note-off always reaches the same place (also after a clip change, a
+    // focus loss or when the grid is hidden). channel -1 = the default one.
+    enum class PreviewSource { Keyboard, Mouse, Typing };
+    void playNotePreview(int noteNumber, int velocity = 100, int channel = -1,
+                         PreviewSource source = PreviewSource::Keyboard);
     void stopNotePreview(int noteNumber);
     void stopAllPreviews();
+    void stopPreviews(PreviewSource source);
+    // Where previews go when no clip is loaded (a selected channel's track).
+    void setPreviewTarget(te::AudioTrack* track, int midiChannel = 1);
+    te::AudioTrack* previewTrack() const;
+    int previewChannel() const;
+
+    // > 0: the editable region is this many beats long whatever the clip's
+    // length, and the clip is never stretched to fit its notes (a pattern
+    // clip: its length is the pattern's). <= 0: follow the clip (default).
+    void setFixedLengthBeats(double beats);
+    double regionLengthBeats() const;
 
     // Copy-drag selection (called by NoteItem after copy-drag)
     void setPendingCopySelect(std::vector<ClipboardNote> notes);
@@ -109,6 +130,9 @@ public:
     double typingCursorBeat() const { return typingCursorBeat_; }
 
     void setEnsureClipCallback(std::function<te::MidiClip*()> cb) { ensureClipCb_ = std::move(cb); }
+    // With no clip loaded, notes can still be drawn: the ensure-clip callback
+    // makes the clip when the first note is committed.
+    void setClipOnDemand(bool on) { clipOnDemand_ = on; }
 
 signals:
     void notesChanged();
@@ -131,6 +155,9 @@ protected:
     void keyReleaseEvent(QKeyEvent* event) override;
     void contextMenuEvent(QContextMenuEvent* event) override;
     void showEvent(QShowEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
+    bool event(QEvent* event) override;
+    void focusOutEvent(QFocusEvent* event) override;
 
 private:
     void drawBackground();
@@ -194,8 +221,17 @@ private:
     QGraphicsSimpleTextItem* typingCursorLabel_ = nullptr;
     std::set<int> heldTypingKeys_;
 
-    // Note preview tracking
-    std::set<int> activePreviewNotes_;
+    // Note preview tracking: note number -> where its note-on went.
+    struct ActivePreview {
+        te::SafeSelectable<te::AudioTrack> track;
+        int channel = 1;
+        PreviewSource source = PreviewSource::Keyboard;
+    };
+    std::map<int, ActivePreview> activePreviewNotes_;
+    te::SafeSelectable<te::AudioTrack> previewTrack_;
+    int previewTargetChannel_ = 1;
+    double fixedLengthBeats_ = 0.0;
+    bool clipOnDemand_ = false;
 
     std::function<te::MidiClip*()> ensureClipCb_;
 };

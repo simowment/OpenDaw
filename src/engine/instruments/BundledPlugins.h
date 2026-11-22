@@ -19,7 +19,9 @@ public:
     static void prepareEnvironment();
 
     // Surge XT's entry in the plugin list, adding it (scanning just that one
-    // plugin) the first time. Message thread; nullopt if it isn't shipped.
+    // plugin, in the OpenDawPluginScanner helper when it's there, else in
+    // process) the first time. Message thread; blocks while scanning; nullopt
+    // if it isn't shipped or failed to scan.
     static std::optional<juce::PluginDescription> surgeXtDescription(juce::KnownPluginList& list);
     static bool isSurgeXt(te::Plugin* plugin);
 };

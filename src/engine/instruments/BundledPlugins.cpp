@@ -1,5 +1,7 @@
 #include "BundledPlugins.h"
+#include "engine/PluginScanner.h"
 #include <juce_audio_processors/juce_audio_processors.h>
+#include <QDebug>
 #include <cstdlib>
 
 namespace OpenDaw {
@@ -57,9 +59,23 @@ std::optional<juce::PluginDescription> BundledPlugins::surgeXtDescription(juce::
     for (const auto& d : list.getTypes())
         if (isOurs(d)) return d;
 
-    juce::VST3PluginFormat vst3;
+    // Scan it in the helper process when there is one, so even the bundled
+    // plugin can't crash the program while being scanned. Only when the
+    // helper is missing or won't start is it scanned here, in-process.
     juce::OwnedArray<juce::PluginDescription> found;
-    vst3.findAllTypesForFile(found, bundle.getFullPathName());
+    QString error;
+    const auto outcome = PluginScanner::scanFileWithHelper(
+        PluginScanner::helperExecutable(), juce::VST3PluginFormat::getFormatName(),
+        bundle.getFullPathName(), found, &error);
+    if (outcome == PluginScanner::HelperOutcome::NotStarted) {
+        found.clear();
+        juce::VST3PluginFormat vst3;
+        vst3.findAllTypesForFile(found, bundle.getFullPathName());
+    } else if (outcome != PluginScanner::HelperOutcome::Scanned) {
+        qWarning() << "[BundledPlugins] Surge XT failed to scan:" << error;
+        return std::nullopt;
+    }
+
     std::optional<juce::PluginDescription> result;
     for (auto* d : found) {
         list.addType(*d);

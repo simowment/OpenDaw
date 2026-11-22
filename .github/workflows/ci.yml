@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '**'
+    tags-ignore:
+      - 'v*'          # release.yml builds tags
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test-linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Pin JUCE to required commit
+        run: |
+          cd libs/JUCE
+          git fetch origin 7c89e11f6b7316c369f3d3f22227c60e816e738b
+          git checkout 7c89e11f6b7316c369f3d3f22227c60e816e738b
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev libjack-jackd2-dev ladspa-sdk \
+            libfreetype-dev libfreetype6-dev \
+            libx11-dev libxcomposite-dev libxcursor-dev libxext-dev \
+            libxinerama-dev libxrandr-dev libxrender-dev \
+            libcurl4-openssl-dev libfontconfig1-dev \
+            libwebkit2gtk-4.0-dev libgtk-3-dev \
+            libglu1-mesa-dev mesa-common-dev \
+            libcups2-dev libssl-dev libxkbcommon-dev \
+            libavformat-dev libavcodec-dev libavutil-dev \
+            libswscale-dev libswresample-dev \
+            ninja-build
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.0'
+          host: 'linux'
+          target: 'desktop'
+          arch: 'linux_gcc_64'
+          cache: true
+
+      - name: Configure CMake
+        run: >
+          cmake -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_PREFIX_PATH="${{ env.QT_ROOT_DIR }}"
+          -DOPENDAW_BUNDLE_SURGE_XT=OFF
+          -DOPENDAW_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+          # Keeps Qt's per-user files of the test run out of the runner's
+          # home directory. (JUCE/Tracktion still use ~/.config/OpenDaw; the
+          # runner is thrown away afterwards.)
+          XDG_CONFIG_HOME: ${{ runner.temp }}/xdg-config
+          XDG_DATA_HOME: ${{ runner.temp }}/xdg-data
+        run: ctest --test-dir build -C Release --output-on-failure --timeout 900

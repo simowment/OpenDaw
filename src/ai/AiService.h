@@ -104,6 +104,14 @@ private:
     int toolRoundCount_ = 0;
 
     QSet<QString> executedToolIds_;
+    // Results of this round's tool calls that already ran, kept while a
+    // destructive call waits for the user so they are sent with the rest.
+    QVector<AiToolResult> pendingResults_;
+    void runToolCall(const AiToolCall& call);
+    // Executes the round's remaining calls in order; false when it paused at a
+    // destructive call awaiting confirmation.
+    bool runRemainingToolCalls(const AiMessage& assistantMsg);
+    QVector<AiToolResult> orderedResults(const AiMessage& assistantMsg) const;
     void pruneHistory();
 };
 
